@@ -11,3 +11,8 @@ searches:
   filters:
     model:
     - samsung_galaxy_fold5
+- key: samsung_galaxy_fold7_used
+  category_id: 0
+  filters:
+    model:
+    - samsung_galaxy_fold7

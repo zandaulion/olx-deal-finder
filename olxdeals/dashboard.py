@@ -45,12 +45,21 @@ _CSS = """
   .btn-del { background:#4a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
   .search { padding:10px 16px 4px; font-size:13px; color:#8a93a2; }
   .search b { color:#cbd3df; }
-  .tabs { display:flex; gap:8px; overflow-x:auto; padding:10px 16px 4px;
-          -webkit-overflow-scrolling:touch; }
-  .tabs a { white-space:nowrap; padding:6px 12px; border-radius:20px;
-            background:#20252e; color:#cbd3df; text-decoration:none;
-            font-size:13px; border:1px solid #2c333f; flex:none; }
-  .tabs a.on { background:#2f5fd0; color:#fff; border-color:#2f5fd0; }
+  .menu { margin:10px 16px 0; }
+  .menu > summary { list-style:none; cursor:pointer; padding:9px 12px;
+          border-radius:8px; background:#20252e; border:1px solid #2c333f;
+          color:#e6e6e6; font-size:14px; display:flex; align-items:center; gap:10px; }
+  .menu > summary::-webkit-details-marker { display:none; }
+  .menu > summary .burger { font-size:16px; color:#8a93a2; }
+  .menu > summary .caret { margin-left:auto; color:#8a93a2; transition:transform .15s; }
+  .menu[open] > summary { border-color:#2f5fd0; }
+  .menu[open] > summary .caret { transform:rotate(180deg); }
+  .menu .items { margin-top:6px; border:1px solid #2c333f; border-radius:8px;
+          overflow:hidden; }
+  .menu .items a { display:block; padding:11px 12px; color:#cbd3df;
+          text-decoration:none; border-bottom:1px solid #20252e; font-size:14px; }
+  .menu .items a:last-child { border-bottom:none; }
+  .menu .items a.on { background:#2f5fd0; color:#fff; }
   .card { display:flex; gap:12px; margin:10px 16px; padding:10px; position:relative;
           background:#161a20; border:1px solid #262c36; border-radius:12px;
           -webkit-touch-callout:none; }
@@ -275,17 +284,22 @@ def _search_keys(config_path: str, db_path: str) -> list[str]:
     return keys
 
 
-def _tabs(keys: list[str], base: str, selected: str | None) -> str:
-    """Filter chips: 'All' + one per search, linking to base?search=key."""
+def _menu(keys: list[str], base: str, selected: str | None) -> str:
+    """Hamburger dropdown: current selection + a list of all searches."""
     if not keys:
         return ""
-    chips = [f'<a href="{base}" class="{"" if selected else "on"}">All</a>']
+    current = selected if selected in keys else None
+    label = html.escape(current) if current else "All searches"
+    items = [f'<a href="{base}" class="{"" if current else "on"}">All searches</a>']
     for k in keys:
-        on = "on" if k == selected else ""
-        chips.append(
+        on = "on" if k == current else ""
+        items.append(
             f'<a href="{base}?search={urllib.parse.quote(k)}" class="{on}">'
             f'{html.escape(k)}</a>')
-    return '<div class="tabs">' + "".join(chips) + "</div>"
+    return (f'<details class="menu"><summary>'
+            f'<span class="burger">&#9776;</span>{label}'
+            f'<span class="caret">&#9662;</span></summary>'
+            f'<div class="items">{"".join(items)}</div></details>')
 
 
 def render_deals(db_path: str, config_path: str, selected: str | None = None,
@@ -318,7 +332,7 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                 _card(l, hist.get(l.raw["id"])) for l in shown))
         body = "".join(blocks) or \
             '<div class="empty">No searches yet. Add one on Manage, then Sync now.</div>'
-        content = _tabs(all_keys, "/", selected) + body
+        content = _menu(all_keys, "/", selected) + body
         scope = f"'{selected}'" if selected else f"{len(all_keys)} search(es)"
         sub = f"{scope} · {total_deals} deal(s) · EUR→RON {EUR_TO_RON}"
     finally:
@@ -351,7 +365,7 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
             body = ('<div class="empty">No price drops recorded yet.<br>'
                     'Drops appear here once a tracked listing gets cheaper '
                     'between syncs — check back after a day or two.</div>')
-        content = _tabs(all_keys, "/drops", selected) + body
+        content = _menu(all_keys, "/drops", selected) + body
         scope = f"'{selected}'" if selected else "all searches"
         sub = f"{len(cards)} price drop(s) · {scope}"
     finally:

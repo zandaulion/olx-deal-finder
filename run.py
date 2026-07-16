@@ -13,6 +13,7 @@ import argparse
 
 from olxdeals.config import load_searches
 from olxdeals.fetcher import OlxFetcher
+from olxdeals.scorer import price_distribution
 from olxdeals.store import Store, SyncResult
 
 
@@ -58,6 +59,10 @@ def main() -> None:
         for spec in specs:
             listings = fetcher.fetch_all(spec)
             result = store.sync(listings, spec.key)
+            # Snapshot the current price distribution for the daily trend chart.
+            dist = price_distribution(store.active_for_search(spec.key))
+            if dist:
+                store.record_stats(spec.key, dist)
             report(result, args.quiet)
 
 

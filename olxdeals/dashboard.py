@@ -36,7 +36,7 @@ _CSS = """
            border-bottom:1px solid #262c36; z-index:5; }
   header h1 { margin:0; font-size:18px; }
   header .sub { color:#8a93a2; font-size:12px; margin-top:2px; }
-  nav { display:flex; gap:8px; margin-top:10px; }
+  nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
   nav a, .btn { display:inline-block; padding:6px 12px; border-radius:8px;
         font-size:13px; text-decoration:none; background:#20252e; color:#cbd3df;
         border:1px solid #2c333f; cursor:pointer; }
@@ -88,6 +88,9 @@ _CSS = """
   .b-drop { background:#3a1f16; color:#f0b6a0; }
   .b-susp { background:#3a2a3a; color:#e0b6f0; }
   .spark { display:block; margin-top:5px; }
+  .chart { margin:6px 16px 14px; padding:10px 6px; background:#161a20;
+           border:1px solid #262c36; border-radius:12px; }
+  .candles { width:100%; height:auto; display:block; }
   .was { color:#8a93a2; font-size:12px; text-decoration:line-through; }
   .drop-pct { color:#f0b6a0; font-size:12px; font-weight:600; }
   .empty { padding:40px 16px; text-align:center; color:#8a93a2; }
@@ -120,6 +123,7 @@ _SHELL = """<!doctype html>
   <nav>
     <a href="/" class="{deals_active}">Deals</a>
     <a href="/drops" class="{drops_active}">Drops</a>
+    <a href="/history" class="{trends_active}">Trends</a>
     <a href="/searches" class="{manage_active}">Manage</a>
     <form method="post" action="/sync" style="margin:0">
       <button class="btn btn-go" type="submit">Sync now</button>
@@ -184,6 +188,7 @@ def _shell(sub: str, content: str, active: str, flash: str = "") -> str:
         css=_CSS, sub=sub, content=content, flash=flash_html,
         deals_active="active" if active == "deals" else "",
         drops_active="active" if active == "drops" else "",
+        trends_active="active" if active == "trends" else "",
         manage_active="active" if active == "searches" else "",
     )
 
@@ -371,6 +376,101 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
     finally:
         store.close()
     return _shell(sub, content, "drops", flash)
+
+
+# ---------- trends (candlestick) page ----------
+
+def _candlestick(candles: list[dict], w: int = 340, h: int = 210) -> str:
+    """SVG candlestick: wick = day min–max, box = Q1–Q3, line = median.
+    Colour: green if median fell vs the previous day, red if it rose."""
+    if not candles:
+        return ('<div class="empty">No trend data yet.<br>One candle is added '
+                'per day as syncs run — check back tomorrow.</div>')
+    padL, padR, padT, padB = 46, 10, 12, 22
+    plot_w, plot_h = w - padL - padR, h - padT - padB
+    lows = [c["low"] for c in candles if c["low"] is not None]
+    highs = [c["high"] for c in candles if c["high"] is not None]
+    if not lows or not highs:
+        return '<div class="empty">No priced listings recorded yet.</div>'
+    lo, hi = min(lows), max(highs)
+    span = (hi - lo) or 1.0
+
+    def y(v: float) -> float:
+        return padT + plot_h * (1 - (v - lo) / span)
+
+    n = len(candles)
+    slot = plot_w / n
+    cw = min(slot * 0.6, 22)
+    p: list[str] = []
+    for val in (lo, (lo + hi) / 2, hi):
+        yy = y(val)
+        p.append(f'<line x1="{padL}" y1="{yy:.1f}" x2="{w-padR}" y2="{yy:.1f}" '
+                 f'stroke="#262c36"/>')
+        p.append(f'<text x="{padL-6}" y="{yy+3:.1f}" text-anchor="end" '
+                 f'fill="#8a93a2" font-size="10">{val:.0f}</text>')
+
+    prev = None
+    for i, c in enumerate(candles):
+        cx = padL + slot * i + slot / 2
+        med = c.get("median")
+        color = "#8a93a2"
+        if prev is not None and med is not None:
+            color = ("#5fd08a" if med < prev else
+                     "#f0b6a0" if med > prev else "#8a93a2")
+        if med is not None:
+            prev = med
+        if c["low"] is not None and c["high"] is not None:
+            p.append(f'<line x1="{cx:.1f}" y1="{y(c["high"]):.1f}" '
+                     f'x2="{cx:.1f}" y2="{y(c["low"]):.1f}" stroke="{color}" '
+                     f'stroke-width="1.4"/>')
+        q1, q3 = c.get("q1"), c.get("q3")
+        if q1 is not None and q3 is not None:
+            top, bot = y(max(q1, q3)), y(min(q1, q3))
+            p.append(f'<rect x="{cx-cw/2:.1f}" y="{top:.1f}" width="{cw:.1f}" '
+                     f'height="{max(bot-top,2):.1f}" fill="{color}" '
+                     f'fill-opacity="0.25" stroke="{color}"/>')
+        if med is not None:
+            p.append(f'<line x1="{cx-cw/2:.1f}" y1="{y(med):.1f}" '
+                     f'x2="{cx+cw/2:.1f}" y2="{y(med):.1f}" stroke="{color}" '
+                     f'stroke-width="2"/>')
+
+    p.append(f'<text x="{padL}" y="{h-6}" fill="#8a93a2" font-size="10">'
+             f'{candles[0]["day"][5:]}</text>')
+    if n > 1:
+        p.append(f'<text x="{w-padR}" y="{h-6}" text-anchor="end" '
+                 f'fill="#8a93a2" font-size="10">{candles[-1]["day"][5:]}</text>')
+    return (f'<svg class="candles" viewBox="0 0 {w} {h}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(p)}</svg>')
+
+
+def render_history(db_path: str, config_path: str, selected: str | None = None,
+                   flash: str = "") -> str:
+    all_keys = _search_keys(config_path, db_path)
+    show = [selected] if selected in all_keys else all_keys
+    store = Store(db_path)
+    try:
+        blocks = [
+            '<div class="note" style="margin:8px 16px 0">Daily candles · '
+            'wick = min–max · box = Q1–Q3 · line = median · '
+            'green = cheaper than previous day</div>']
+        for key in show:
+            candles = store.daily_candles(key)
+            blocks.append(
+                f'<div class="search"><b>{html.escape(key)}</b> · '
+                f'{len(candles)} day(s) tracked</div>')
+            if candles:
+                last = candles[-1]
+                blocks.append(
+                    f'<div class="note" style="margin:0 16px 4px">latest: '
+                    f'min {last["low"]:.0f} · median {last["median"]:.0f} · '
+                    f'max {last["high"]:.0f} RON · {last["n"]} listings</div>')
+            blocks.append(f'<div class="chart">{_candlestick(candles)}</div>')
+        body = "".join(blocks)
+        content = _menu(all_keys, "/history", selected) + body
+        sub = "daily min / median / max per search"
+    finally:
+        store.close()
+    return _shell(sub, content, "trends", flash)
 
 
 # ---------- management page ----------
@@ -618,6 +718,9 @@ class Handler(BaseHTTPRequestHandler):
             self._html(render_deals(self.db_path, self.config_path, selected, flash))
         elif parsed.path == "/drops":
             self._html(render_drops(self.db_path, self.config_path, selected, flash))
+        elif parsed.path == "/history":
+            self._html(render_history(
+                self.db_path, self.config_path, selected, flash))
         elif parsed.path == "/searches":
             edit_key = qs.get("edit", [None])[0]
             self._html(render_searches(

@@ -77,6 +77,24 @@ class SearchDeals:
         return [l for l in self.listings if l.suspicious]
 
 
+def price_distribution(listings: Iterable[dict[str, Any]]) -> dict[str, float] | None:
+    """min/Q1/median/Q3/max over the clean (RON, non-junk) prices, or None."""
+    prices = sorted(
+        p for it in listings
+        if (p := to_ron(it.get("price"), it.get("currency")))
+        and p > 0 and not is_junk(it.get("title"))
+    )
+    if not prices:
+        return None
+    n = len(prices)
+    if n >= 4:
+        q1, med, q3 = statistics.quantiles(prices, n=4)
+    else:
+        q1, med, q3 = prices[0], statistics.median(prices), prices[-1]
+    return {"n": n, "min": prices[0], "q1": q1,
+            "median": med, "q3": q3, "max": prices[-1]}
+
+
 def score_search(search_key: str, listings: Iterable[dict[str, Any]],
                  threshold: float = DEAL_THRESHOLD) -> SearchDeals:
     """Score every listing in one search against its clean-price distribution."""

@@ -49,6 +49,20 @@ CREATE TABLE IF NOT EXISTS price_history (
     ts       TEXT NOT NULL,
     PRIMARY KEY (id, ts)
 );
+
+CREATE TABLE IF NOT EXISTS price_stats (
+    search_key TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    n          INTEGER,
+    min        REAL,
+    q1         REAL,
+    median     REAL,
+    q3         REAL,
+    max        REAL,
+    PRIMARY KEY (search_key, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_stats_search ON price_stats(search_key, day);
 """
 
 _FIELDS = [
@@ -191,6 +205,42 @@ class Store:
             (1 if value else 0, listing_id),
         )
         self.conn.commit()
+
+    def record_stats(self, search_key: str, stats: dict[str, Any]) -> None:
+        """Store one distribution snapshot (called once per sync per search)."""
+        now = _now()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO price_stats "
+            "(search_key, ts, day, n, min, q1, median, q3, max) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (search_key, now, now[:10], stats.get("n"), stats.get("min"),
+             stats.get("q1"), stats.get("median"), stats.get("q3"),
+             stats.get("max")),
+        )
+        self.conn.commit()
+
+    def daily_candles(self, search_key: str) -> list[dict[str, Any]]:
+        """Aggregate snapshots into one candle per day: min/max span the whole
+        day; Q1/median/Q3/n come from that day's latest snapshot."""
+        rows = self.conn.execute(
+            "SELECT day, n, min, q1, median, q3, max FROM price_stats "
+            "WHERE search_key = ? ORDER BY ts",
+            (search_key,),
+        ).fetchall()
+        by_day: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            d = by_day.get(r["day"])
+            if d is None:
+                d = {"day": r["day"], "low": r["min"], "high": r["max"]}
+                by_day[r["day"]] = d
+            if r["min"] is not None:
+                d["low"] = r["min"] if d["low"] is None else min(d["low"], r["min"])
+            if r["max"] is not None:
+                d["high"] = r["max"] if d["high"] is None else max(d["high"], r["max"])
+            # Latest snapshot of the day wins for the distribution body.
+            d["q1"], d["median"], d["q3"], d["n"] = (
+                r["q1"], r["median"], r["q3"], r["n"])
+        return list(by_day.values())
 
     def excluded_listings(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

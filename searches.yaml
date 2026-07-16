@@ -1,0 +1,13 @@
+searches:
+- key: samsung_galaxy_fold6_used
+  category_id: 0
+  filters:
+    model:
+    - samsung_galaxy_fold6
+  price_from: 1000
+  price_to: 8000
+- key: samsung_galaxy_fold5_used
+  category_id: 0
+  filters:
+    model:
+    - samsung_galaxy_fold5

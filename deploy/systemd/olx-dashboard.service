@@ -1,0 +1,13 @@
+[Unit]
+Description=OLX Deals dashboard (local web UI, reachable over Tailscale)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=~/Projects/OLX
+ExecStart=/usr/bin/python3 -m olxdeals.dashboard --db ~/Projects/OLX/olxdeals.db --config ~/Projects/OLX/searches.yaml --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -69,6 +70,23 @@ _CSS = """
           display:flex; align-items:center; justify-content:center; font-size:14px;
           border:1px solid #2c333f; }
   .hide-btn:active { background:#4a1f1f; color:#f0b6b6; }
+  .card.seen { opacity:0.5; }
+  .fav-btn { position:absolute; top:6px; left:8px; width:26px; height:26px;
+          border-radius:50%; background:#20252ecc; color:#8a93a2; z-index:2;
+          display:flex; align-items:center; justify-content:center; font-size:15px;
+          border:1px solid #2c333f; }
+  .fav-btn.on { color:#f0c040; border-color:#6b5a1e; }
+  .seen-btn { display:inline-block; margin-top:5px; font-size:12px; color:#8a93a2;
+          border:1px solid #2c333f; border-radius:6px; padding:2px 9px; }
+  .seen-btn.on { color:#8fd0a0; border-color:#2f5f3c; }
+  .b-new { background:#123a3a; color:#a6eaea; }
+  .controls { margin:8px 16px 0; display:flex; flex-wrap:wrap; gap:8px;
+          align-items:center; font-size:13px; color:#8a93a2; }
+  .controls select, .controls input { background:#0f1115; color:#e6e6e6;
+          border:1px solid #2c333f; border-radius:6px; padding:5px 7px; font-size:13px; }
+  .controls input.px { width:72px; }
+  .controls .apply { background:#2f5fd0; color:#fff; border-color:#2f5fd0;
+          cursor:pointer; }
   .card.deal { border-color:#2f7d4f; background:#132018; }
   a.card { text-decoration:none; color:inherit; }
   a.card:active { background:#1c2230; }
@@ -110,6 +128,8 @@ _CSS = """
   .note { color:#8a93a2; font-size:12px; margin:6px 16px; }
   .flash { margin:10px 16px; padding:10px; border-radius:8px; background:#16321f;
            color:#c9f5d9; border:1px solid #1e5f3c; font-size:13px; }
+  .flash.warn { background:#3a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
+  .flash code { background:#00000033; padding:1px 5px; border-radius:4px; }
 """
 
 _SHELL = """<!doctype html>
@@ -124,6 +144,7 @@ _SHELL = """<!doctype html>
   <nav>
     <a href="/" class="{deals_active}">Deals</a>
     <a href="/drops" class="{drops_active}">Drops</a>
+    <a href="/saved" class="{saved_active}">★ Saved</a>
     <a href="/history" class="{trends_active}">Trends</a>
     <a href="/searches" class="{manage_active}">Manage</a>
     <form method="post" action="/sync" style="margin:0">
@@ -164,6 +185,29 @@ function hideCard(e, btn) {{
   e.preventDefault(); e.stopPropagation();
   askHide(btn.closest('a.card'));
 }}
+// Toggle a per-listing flag (favorite / seen) without navigating.
+function toggleFlag(e, btn, path, cls, onOk) {{
+  e.preventDefault(); e.stopPropagation();
+  var card = btn.closest('a.card'); if (!card) return;
+  var on = !btn.classList.contains('on');
+  fetch(path, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'id=' + encodeURIComponent(card.dataset.id) + '&on=' + (on ? '1' : '0')
+  }}).then(function(r) {{ if (r.ok) {{
+    btn.classList.toggle('on', on);
+    if (cls) card.classList.toggle(cls, on);
+    if (onOk) onOk(on);
+  }} }});
+}}
+function toggleFav(e, btn) {{
+  toggleFlag(e, btn, '/favorite', null,
+    function(on) {{ btn.textContent = on ? '\\u2605' : '\\u2606'; }});
+}}
+function toggleSeen(e, btn) {{
+  toggleFlag(e, btn, '/seen', 'seen',
+    function(on) {{ btn.textContent = on ? 'seen \\u2713' : 'mark seen'; }});
+}}
 // Long-press gesture as an alternative to the ✕ button.
 document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
   var timer = null, fired = false;
@@ -183,18 +227,73 @@ document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
 </body></html>"""
 
 
+def _time_ago(iso: str | None) -> str:
+    if not iso:
+        return "never"
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    secs = (datetime.now(timezone.utc) - t).total_seconds()
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return f"{int(secs / 60)}m ago"
+    if secs < 172800:
+        return f"{int(secs / 3600)}h ago"
+    return f"{int(secs / 86400)}d ago"
+
+
+def _is_recent(iso: str | None, hours: float) -> bool:
+    if not iso:
+        return False
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds() < hours * 3600
+
+
+def _sync_banner(store: Store) -> str:
+    """Red banner when the most recent sync of any search failed."""
+    runs = store.last_runs()
+    failed = [k for k, r in runs.items() if not r.get("ok")]
+    if not failed:
+        return ""
+    names = ", ".join(html.escape(k) for k in failed)
+    return (f'<div class="flash warn">&#9888; Last sync failed for {names}. '
+            f'Data may be stale — see <code>journalctl --user -u olx-sync</code>.'
+            f'</div>')
+
+
+def _last_sync_text(store: Store) -> str:
+    runs = store.last_runs()
+    if not runs:
+        return "never synced"
+    latest = max(r["ts"] for r in runs.values())
+    return f"synced {_time_ago(latest)}"
+
+
 def _shell(sub: str, content: str, active: str, flash: str = "") -> str:
     flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
     return _SHELL.format(
         css=_CSS, sub=sub, content=content, flash=flash_html,
         deals_active="active" if active == "deals" else "",
         drops_active="active" if active == "drops" else "",
+        saved_active="active" if active == "saved" else "",
         trends_active="active" if active == "trends" else "",
         manage_active="active" if active == "searches" else "",
     )
 
 
 # ---------- deals page ----------
+
+DISPLAY_CAP = 80  # max cards rendered per Deals view (after sort/filter)
+
 
 def _ron_series(history: list | None) -> list[float]:
     """Normalise a price-history series to RON floats, dropping blanks."""
@@ -236,6 +335,9 @@ def _card(sl, history: list | None = None, search_label: str | None = None) -> s
     img = (f'<img class="thumb" loading="lazy" src="{thumb}">'
            if thumb else '<div class="thumb"></div>')
     badges = ""
+    # Freshly-appeared listings (first tracked <24h ago) are the best signal.
+    if _is_recent(r.get("first_seen"), 24):
+        badges += '<span class="badge b-new">NEW</span>'
     if sl.is_deal:
         badges += f'<span class="badge b-deal">−{sl.deal_score*100:.0f}% deal</span>'
     elif sl.suspicious:
@@ -246,10 +348,16 @@ def _card(sl, history: list | None = None, search_label: str | None = None) -> s
     pp = r.get("previous_price")
     if pp is not None and r.get("price") is not None and pp > r["price"]:
         badges += '<span class="badge b-drop">price drop</span>'
-    city = html.escape(r.get("city") or "")
+
+    meta_bits = []
+    if r.get("city"):
+        meta_bits.append(html.escape(r["city"]))
+    posted = _time_ago(r.get("created_time"))
+    if posted and posted != "never":
+        meta_bits.append(f"posted {posted}")
     if search_label:
-        city = (f'{city} · ' if city else '') + \
-               f'<span style="color:#6b7280">{html.escape(search_label)}</span>'
+        meta_bits.append(f'<span style="color:#6b7280">{html.escape(search_label)}</span>')
+    city = " · ".join(meta_bits)
 
     # Price history: sparkline + "was X (−Y%)" when the price has fallen.
     series = _ron_series(history)
@@ -262,8 +370,16 @@ def _card(sl, history: list | None = None, search_label: str | None = None) -> s
                      f'<span class="drop-pct">−{pct:.0f}%</span></div>')
         trend += _sparkline(series)
 
-    return f"""<a class="card {'deal' if sl.is_deal else ''}" href="{url}"
+    fav_on = "on" if r.get("favorite") else ""
+    fav_glyph = "★" if r.get("favorite") else "☆"
+    seen_on = "on" if r.get("seen") else ""
+    seen_txt = "seen ✓" if r.get("seen") else "mark seen"
+    seen_cls = "seen" if r.get("seen") else ""
+
+    return f"""<a class="card {'deal' if sl.is_deal else ''} {seen_cls}" href="{url}"
    target="_blank" rel="noopener" data-olx="{url}" data-id="{r.get('id')}">
+  <span class="fav-btn {fav_on}" title="Save to favorites"
+        onclick="toggleFav(event, this)">{fav_glyph}</span>
   <span class="hide-btn" title="Hide from tracking"
         onclick="hideCard(event, this)">✕</span>
   {img}
@@ -273,6 +389,7 @@ def _card(sl, history: list | None = None, search_label: str | None = None) -> s
     <div>{badges}</div>
     <div class="meta">{city}</div>
     {trend}
+    <span class="seen-btn {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
   </div>
 </a>"""
 
@@ -311,8 +428,39 @@ def _menu(keys: list[str], base: str, selected: str | None) -> str:
             f'<div class="items">{"".join(items)}</div></details>')
 
 
+def _controls_bar(selected: str | None, f: dict) -> str:
+    """Sort/filter control bar; a GET form that reloads with query params."""
+    def opt(name, value, label):
+        sel = "selected" if f.get(name) == value else ""
+        return f'<option value="{value}" {sel}>{label}</option>'
+    hidden = (f'<input type="hidden" name="search" value="{html.escape(selected)}">'
+              if selected else "")
+    checked = "checked" if f.get("hide_seen") else ""
+    return f"""<form class="controls" method="get" action="/">{hidden}
+  Sort <select name="sort">
+    {opt('sort','deal','deal %')}{opt('sort','price_asc','price ↑')}
+    {opt('sort','price_desc','price ↓')}{opt('sort','newest','newest')}
+  </select>
+  Seller <select name="seller">
+    {opt('seller','all','all')}{opt('seller','private','private')}
+    {opt('seller','dealer','dealer')}
+  </select>
+  <input class="px" name="pmin" inputmode="numeric" placeholder="min"
+         value="{f.get('pmin') or ''}">–<input class="px" name="pmax"
+         inputmode="numeric" placeholder="max" value="{f.get('pmax') or ''}">RON
+  <label><input type="checkbox" name="hide_seen" value="1" {checked}> hide seen</label>
+  <button class="apply" type="submit">Apply</button>
+</form>"""
+
+
 def render_deals(db_path: str, config_path: str, selected: str | None = None,
-                 flash: str = "") -> str:
+                 flash: str = "", filters: dict | None = None) -> str:
+    f = filters or {}
+    seller = f.get("seller", "all")
+    pmin, pmax = f.get("pmin"), f.get("pmax")
+    hide_seen = bool(f.get("hide_seen"))
+    sort = f.get("sort", "deal")
+
     all_keys = _search_keys(config_path, db_path)
     show = [selected] if selected in all_keys else all_keys
     viewing_all = selected not in all_keys
@@ -340,26 +488,84 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                     '<div class="note" style="margin:0 16px 8px">'
                     'No active listings — try Sync now.</div>')
                 continue
-            shown = deals + [l for l in sd.listings if not l.is_deal][:20]
-            for l in shown:
+            # Include every listing; filtering/sorting/capping happen below so
+            # the sort controls see the whole set, not a deal-score subset.
+            for l in sd.listings:
                 pool.append((key, l, hist.get(l.raw["id"])))
 
-        if viewing_all:
-            # Flatten and rank by deal % across every search, best first.
-            pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
-            cards = "".join(_card(l, h, search_label=key) for key, l, h in pool)
-        else:
-            # Single search: score_search already sorted these by deal %.
-            cards = "".join(_card(l, h) for _, l, h in pool)
+        # --- filters ---
+        def keep(sl) -> bool:
+            r = sl.raw
+            if seller == "private" and r.get("is_business"):
+                return False
+            if seller == "dealer" and not r.get("is_business"):
+                return False
+            p = sl.price_ron
+            if pmin is not None and (p is None or p < pmin):
+                return False
+            if pmax is not None and (p is None or p > pmax):
+                return False
+            if hide_seen and r.get("seen"):
+                return False
+            return True
+        pool = [t for t in pool if keep(t[1])]
 
+        # --- sort (then always sink 'seen' to the bottom, stably) ---
+        if sort == "price_asc":
+            pool.sort(key=lambda t: (t[1].price_ron is None, t[1].price_ron or 0))
+        elif sort == "price_desc":
+            pool.sort(key=lambda t: t[1].price_ron or 0, reverse=True)
+        elif sort == "newest":
+            pool.sort(key=lambda t: t[1].raw.get("created_time") or "", reverse=True)
+        else:  # deal %
+            pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
+        pool.sort(key=lambda t: bool(t[1].raw.get("seen")))  # unseen first, stable
+        pool = pool[:DISPLAY_CAP]  # bound page weight after sort/filter
+
+        cards = "".join(
+            _card(l, h, search_label=key if viewing_all else None)
+            for key, l, h in pool)
         body = "".join(summary_blocks) + cards or \
             '<div class="empty">No searches yet. Add one on Manage, then Sync now.</div>'
-        content = _menu(all_keys, "/", selected) + body
+        content = (_sync_banner(store) + _menu(all_keys, "/", selected)
+                   + _controls_bar(selected, f) + body)
         scope = f"'{selected}'" if selected else f"{len(all_keys)} search(es)"
-        sub = f"{scope} · {total_deals} deal(s) · EUR→RON {EUR_TO_RON}"
+        sub = (f"{scope} · {total_deals} deal(s) · {_last_sync_text(store)} · "
+               f"EUR→RON {EUR_TO_RON}")
     finally:
         store.close()
     return _shell(sub, content, "deals", flash)
+
+
+def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
+    """Favorited listings across all searches, best deal first."""
+    store = Store(db_path)
+    try:
+        favs = store.favorite_listings()
+        fav_ids = {r["id"] for r in favs}
+        by_key: dict[str, list] = {}
+        for r in favs:
+            by_key.setdefault(r["search_key"], [])
+        cards_data: list[tuple[float, str, Any, list | None]] = []
+        for key in by_key:
+            active = store.active_for_search(key)
+            sd = score_search(key, active)
+            hist = store.histories([l.raw["id"] for l in sd.listings])
+            for l in sd.listings:
+                if l.raw["id"] in fav_ids:
+                    cards_data.append((l.deal_score, key, l, hist.get(l.raw["id"])))
+        cards_data.sort(key=lambda t: t[0], reverse=True)
+        if cards_data:
+            body = "".join(_card(l, h, search_label=key)
+                           for _, key, l, h in cards_data)
+        else:
+            body = ('<div class="empty">No saved listings yet.<br>'
+                    'Tap the ☆ on any card to save it here.</div>')
+        content = _sync_banner(store) + body
+        sub = f"{len(cards_data)} saved listing(s)"
+    finally:
+        store.close()
+    return _shell(sub, content, "saved", flash)
 
 
 def render_drops(db_path: str, config_path: str, selected: str | None = None,
@@ -387,7 +593,7 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
             body = ('<div class="empty">No price drops recorded yet.<br>'
                     'Drops appear here once a tracked listing gets cheaper '
                     'between syncs — check back after a day or two.</div>')
-        content = _menu(all_keys, "/drops", selected) + body
+        content = _sync_banner(store) + _menu(all_keys, "/drops", selected) + body
         scope = f"'{selected}'" if selected else "all searches"
         sub = f"{len(cards)} price drop(s) · {scope}"
     finally:
@@ -483,7 +689,7 @@ def render_history(db_path: str, config_path: str, selected: str | None = None,
                     f'max {last["high"]:.0f} RON · {last["n"]} listings</div>')
             blocks.append(f'<div class="chart">{_candlestick(candles)}</div>')
         body = "".join(blocks)
-        content = _menu(all_keys, "/history", selected) + body
+        content = _sync_banner(store) + _menu(all_keys, "/history", selected) + body
         sub = "daily min / median / max per search"
     finally:
         store.close()
@@ -626,9 +832,11 @@ function setModel(k){
     # Hidden listings — excluded via ✕ / long-press, restorable here.
     store = Store(db_path)
     try:
+        banner = _sync_banner(store)
         hidden = store.excluded_listings()
     finally:
         store.close()
+    content = banner + content
     if hidden:
         hrows = []
         for h in hidden:
@@ -732,7 +940,17 @@ class Handler(BaseHTTPRequestHandler):
         flash = qs.get("msg", [""])[0]
         selected = qs.get("search", [None])[0]
         if parsed.path in ("/", "/index.html"):
-            self._html(render_deals(self.db_path, self.config_path, selected, flash))
+            filters = {
+                "sort": qs.get("sort", ["deal"])[0],
+                "seller": qs.get("seller", ["all"])[0],
+                "pmin": _int_or_none(qs.get("pmin", [None])[0]),
+                "pmax": _int_or_none(qs.get("pmax", [None])[0]),
+                "hide_seen": qs.get("hide_seen", [None])[0] == "1",
+            }
+            self._html(render_deals(
+                self.db_path, self.config_path, selected, flash, filters))
+        elif parsed.path == "/saved":
+            self._html(render_saved(self.db_path, self.config_path, flash))
         elif parsed.path == "/drops":
             self._html(render_drops(self.db_path, self.config_path, selected, flash))
         elif parsed.path == "/history":
@@ -789,6 +1007,21 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_response(204)  # async ✕ / long-press call
                     self.end_headers()
+            elif parsed.path in ("/favorite", "/seen"):
+                form = self._form()
+                lid = _int_or_none(form.get("id"))
+                on = form.get("on", "1") == "1"
+                if lid is not None:
+                    store = Store(self.db_path)
+                    try:
+                        if parsed.path == "/favorite":
+                            store.set_favorite(lid, on)
+                        else:
+                            store.set_seen(lid, on)
+                    finally:
+                        store.close()
+                self.send_response(204)  # async star / seen toggle
+                self.end_headers()
             elif parsed.path == "/sync":
                 self._trigger_sync()
                 self._redirect("/?msg=" + urllib.parse.quote(

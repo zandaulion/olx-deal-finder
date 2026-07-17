@@ -7,6 +7,7 @@ raw offer into a flat ``Listing`` dict that the rest of the pipeline consumes.
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -25,9 +26,13 @@ _HEADERS = {
     "Accept-Language": "ro-RO,ro;q=0.9,en;q=0.8",
 }
 
-# OLX honours ~50 offers per page; the API caps a query at 1000 total results.
+# OLX caps a page at 50 offers (100+ is rejected) and a query at 1000 total.
 PAGE_LIMIT = 50
 MAX_RESULTS = 1000
+
+# Transient statuses worth backing off and retrying rather than failing.
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_BACKOFF = 30.0
 
 
 @dataclass
@@ -108,32 +113,63 @@ def normalise(offer: dict[str, Any], search_key: str) -> dict[str, Any]:
 class OlxFetcher:
     """Polite, paginating client for a single OLX search."""
 
-    def __init__(self, delay: float = 1.0, timeout: float = 25.0):
+    def __init__(self, delay: float = 1.0, jitter: float = 0.5,
+                 timeout: float = 25.0, max_retries: int = 3):
         self.delay = delay
+        self.jitter = jitter
         self.timeout = timeout
+        self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update(_HEADERS)
+
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter, capped."""
+        return min(2.0 ** attempt, MAX_BACKOFF) + random.uniform(0, self.jitter)
+
+    @staticmethod
+    def _retry_after(resp: requests.Response) -> float | None:
+        ra = resp.headers.get("Retry-After")
+        if ra and ra.strip().isdigit():
+            return float(ra.strip())
+        return None
+
+    def _get(self, params: list[tuple[str, str]]) -> dict[str, Any]:
+        """GET one page, retrying transient failures with backoff."""
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self.session.get(API_URL, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise
+                time.sleep(self._backoff(attempt))
+                continue
+            if resp.status_code in RETRY_STATUSES and attempt < self.max_retries:
+                wait = self._retry_after(resp)
+                time.sleep(wait if wait is not None else self._backoff(attempt))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        if last_exc:  # pragma: no cover - defensive
+            raise last_exc
+        raise RuntimeError("exhausted retries without a response")
 
     def iter_offers(self, spec: SearchSpec) -> Iterator[dict[str, Any]]:
         """Yield normalised listings for a search, page by page."""
         offset = 0
-        seen = 0
         while offset < MAX_RESULTS:
-            params = spec.build_params(offset, PAGE_LIMIT)
-            resp = self.session.get(API_URL, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            payload = resp.json()
+            payload = self._get(spec.build_params(offset, PAGE_LIMIT))
             batch = payload.get("data") or []
             if not batch:
                 break
             for offer in batch:
                 yield normalise(offer, spec.key)
-                seen += 1
             # Stop when the API says there's no next page.
             if not (payload.get("links") or {}).get("next"):
                 break
             offset += PAGE_LIMIT
-            time.sleep(self.delay)
+            time.sleep(self.delay + random.uniform(0, self.jitter))
 
     def fetch_all(self, spec: SearchSpec) -> list[dict[str, Any]]:
         return list(self.iter_offers(spec))

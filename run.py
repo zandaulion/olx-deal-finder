@@ -10,6 +10,7 @@ and print what's new / changed / gone.
 from __future__ import annotations
 
 import argparse
+import time
 
 from olxdeals.config import load_searches
 from olxdeals.fetcher import OlxFetcher
@@ -48,22 +49,40 @@ def main() -> None:
     ap.add_argument("--config", default="searches.yaml")
     ap.add_argument("--db", default="olxdeals.db")
     ap.add_argument("--delay", type=float, default=1.0,
-                    help="seconds between API pages (be polite)")
+                    help="base seconds between API pages (be polite)")
+    ap.add_argument("--jitter", type=float, default=0.5,
+                    help="extra random delay added to each wait, in seconds")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     specs = load_searches(args.config)
-    fetcher = OlxFetcher(delay=args.delay)
+    fetcher = OlxFetcher(delay=args.delay, jitter=args.jitter)
 
+    failures = 0
     with Store(args.db) as store:
         for spec in specs:
-            listings = fetcher.fetch_all(spec)
+            started = time.monotonic()
+            try:
+                # Fetch fully before touching the DB: a mid-pagination failure
+                # then aborts this search cleanly (no partial removal-marking).
+                listings = fetcher.fetch_all(spec)
+            except Exception as exc:  # fail-soft: one search can't kill the rest
+                failures += 1
+                dur = int((time.monotonic() - started) * 1000)
+                store.record_run(spec.key, ok=False, duration_ms=dur, error=str(exc))
+                print(f"[{spec.key}] FETCH FAILED: {exc}")
+                continue
             result = store.sync(listings, spec.key)
             # Snapshot the current price distribution for the daily trend chart.
             dist = price_distribution(store.active_for_search(spec.key))
             if dist:
                 store.record_stats(spec.key, dist)
+            dur = int((time.monotonic() - started) * 1000)
+            store.record_run(spec.key, ok=True, duration_ms=dur, result=result)
             report(result, args.quiet)
+
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

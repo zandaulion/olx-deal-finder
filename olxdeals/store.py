@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS listings (
     first_seen        TEXT NOT NULL,
     last_seen         TEXT NOT NULL,
     active            INTEGER NOT NULL DEFAULT 1,
-    excluded          INTEGER NOT NULL DEFAULT 0
+    excluded          INTEGER NOT NULL DEFAULT 0,
+    favorite          INTEGER NOT NULL DEFAULT 0,
+    seen              INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(search_key, active);
 CREATE INDEX IF NOT EXISTS idx_listings_model  ON listings(model, state);
@@ -63,6 +65,20 @@ CREATE TABLE IF NOT EXISTS price_stats (
     PRIMARY KEY (search_key, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_stats_search ON price_stats(search_key, day);
+
+CREATE TABLE IF NOT EXISTS sync_runs (
+    search_key    TEXT NOT NULL,
+    ts            TEXT NOT NULL,
+    ok            INTEGER NOT NULL,
+    duration_ms   INTEGER,
+    new           INTEGER,
+    price_changes INTEGER,
+    removed       INTEGER,
+    seen          INTEGER,
+    error         TEXT,
+    PRIMARY KEY (search_key, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_runs_search ON sync_runs(search_key, ts);
 """
 
 _FIELDS = [
@@ -108,9 +124,11 @@ class Store:
     def _migrate(self) -> None:
         """Add columns introduced after a DB was first created."""
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(listings)")}
-        if "excluded" not in cols:
-            self.conn.execute(
-                "ALTER TABLE listings ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
+        for col in ("excluded", "favorite", "seen"):
+            if col not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE listings ADD COLUMN {col} "
+                    "INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         self.conn.close()
@@ -199,12 +217,29 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def set_excluded(self, listing_id: int, value: bool) -> None:
+    def _set_flag(self, column: str, listing_id: int, value: bool) -> None:
+        assert column in ("excluded", "favorite", "seen")
         self.conn.execute(
-            "UPDATE listings SET excluded = ? WHERE id = ?",
+            f"UPDATE listings SET {column} = ? WHERE id = ?",
             (1 if value else 0, listing_id),
         )
         self.conn.commit()
+
+    def set_excluded(self, listing_id: int, value: bool) -> None:
+        self._set_flag("excluded", listing_id, value)
+
+    def set_favorite(self, listing_id: int, value: bool) -> None:
+        self._set_flag("favorite", listing_id, value)
+
+    def set_seen(self, listing_id: int, value: bool) -> None:
+        self._set_flag("seen", listing_id, value)
+
+    def favorite_listings(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM listings WHERE active = 1 AND excluded = 0 "
+            "AND favorite = 1 ORDER BY search_key, price",
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def record_stats(self, search_key: str, stats: dict[str, Any]) -> None:
         """Store one distribution snapshot (called once per sync per search)."""
@@ -241,6 +276,32 @@ class Store:
             d["q1"], d["median"], d["q3"], d["n"] = (
                 r["q1"], r["median"], r["q3"], r["n"])
         return list(by_day.values())
+
+    def record_run(self, search_key: str, ok: bool, duration_ms: int,
+                   result: "SyncResult | None" = None,
+                   error: str | None = None) -> None:
+        """Record the outcome of one search's sync (for dashboard visibility)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_runs "
+            "(search_key, ts, ok, duration_ms, new, price_changes, removed, "
+            "seen, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (search_key, _now(), 1 if ok else 0, duration_ms,
+             len(result.new) if result else None,
+             len(result.price_changes) if result else None,
+             len(result.removed) if result else None,
+             result.total_seen if result else None,
+             error),
+        )
+        self.conn.commit()
+
+    def last_runs(self) -> dict[str, dict[str, Any]]:
+        """Latest sync run per search_key."""
+        rows = self.conn.execute(
+            "SELECT r.* FROM sync_runs r JOIN (SELECT search_key, MAX(ts) mt "
+            "FROM sync_runs GROUP BY search_key) m "
+            "ON r.search_key = m.search_key AND r.ts = m.mt",
+        ).fetchall()
+        return {r["search_key"]: dict(r) for r in rows}
 
     def excluded_listings(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

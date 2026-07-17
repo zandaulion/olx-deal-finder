@@ -262,26 +262,21 @@ class Store:
         self.conn.commit()
 
     def daily_candles(self, search_key: str) -> list[dict[str, Any]]:
-        """Aggregate snapshots into one candle per day: min/max span the whole
-        day; Q1/median/Q3/n come from that day's latest snapshot."""
+        """One candle per day, taken entirely from that day's LAST snapshot, so
+        every part (wick min/max, box Q1–Q3, median) describes one consistent
+        population. (Spanning min/max across the day mixed populations whenever a
+        search was edited or a transient junk listing appeared mid-day.)"""
         rows = self.conn.execute(
             "SELECT day, n, min, q1, median, q3, max FROM price_stats "
             "WHERE search_key = ? ORDER BY ts",
             (search_key,),
         ).fetchall()
         by_day: dict[str, dict[str, Any]] = {}
-        for r in rows:
-            d = by_day.get(r["day"])
-            if d is None:
-                d = {"day": r["day"], "low": r["min"], "high": r["max"]}
-                by_day[r["day"]] = d
-            if r["min"] is not None:
-                d["low"] = r["min"] if d["low"] is None else min(d["low"], r["min"])
-            if r["max"] is not None:
-                d["high"] = r["max"] if d["high"] is None else max(d["high"], r["max"])
-            # Latest snapshot of the day wins for the distribution body.
-            d["q1"], d["median"], d["q3"], d["n"] = (
-                r["q1"], r["median"], r["q3"], r["n"])
+        for r in rows:  # ordered by ts -> last write per day wins, position kept
+            by_day[r["day"]] = {
+                "day": r["day"], "low": r["min"], "high": r["max"],
+                "q1": r["q1"], "median": r["median"], "q3": r["q3"], "n": r["n"],
+            }
         return list(by_day.values())
 
     def add_subscription(self, sub: dict[str, Any]) -> None:

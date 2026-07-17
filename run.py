@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 from olxdeals.config import load_searches
 from olxdeals.fetcher import OlxFetcher
-from olxdeals.scorer import price_distribution
+from olxdeals.push import Push
+from olxdeals.scorer import price_distribution, score_search
 from olxdeals.store import Store, SyncResult
 
 
@@ -44,6 +46,29 @@ def report(result: SyncResult, quiet: bool) -> None:
         print(f"  - {len(result.removed)} listing(s) no longer in results")
 
 
+def notify_new_deals(store, push, search_key, active, result) -> None:
+    """Push a batched notification when newly-appeared listings are deals."""
+    subs = store.all_subscriptions()
+    if not subs or not result.new:
+        return
+    new_ids = {l["id"] for l in result.new}
+    sd = score_search(search_key, active)
+    new_deals = [sl for sl in sd.listings
+                 if sl.raw["id"] in new_ids and sl.is_deal]
+    if not new_deals:
+        return
+    cheapest = min(new_deals, key=lambda s: s.price_ron or float("inf"))
+    n = len(new_deals)
+    payload = {
+        "title": f"{n} new deal{'s' if n > 1 else ''} · {search_key}",
+        "body": f"from {cheapest.price_ron:.0f} RON — {cheapest.raw['title'][:70]}",
+        "url": f"/?search={search_key}",
+        "tag": f"deal-{search_key}",
+    }
+    for endpoint in push.notify_all(subs, payload):
+        store.remove_subscription(endpoint)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sync OLX searches into the local DB")
     ap.add_argument("--config", default="searches.yaml")
@@ -57,6 +82,7 @@ def main() -> None:
 
     specs = load_searches(args.config)
     fetcher = OlxFetcher(delay=args.delay, jitter=args.jitter)
+    push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
 
     failures = 0
     with Store(args.db) as store:
@@ -73,10 +99,12 @@ def main() -> None:
                 print(f"[{spec.key}] FETCH FAILED: {exc}")
                 continue
             result = store.sync(listings, spec.key)
+            active = store.active_for_search(spec.key)
             # Snapshot the current price distribution for the daily trend chart.
-            dist = price_distribution(store.active_for_search(spec.key))
+            dist = price_distribution(active)
             if dist:
                 store.record_stats(spec.key, dist)
+            notify_new_deals(store, push, spec.key, active, result)
             dur = int((time.monotonic() - started) * 1000)
             store.record_run(spec.key, ok=True, duration_ms=dur, result=result)
             report(result, args.quiet)

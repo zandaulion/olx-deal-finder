@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     PRIMARY KEY (search_key, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_search ON sync_runs(search_key, ts);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    p256dh   TEXT NOT NULL,
+    auth     TEXT NOT NULL,
+    created  TEXT NOT NULL
+);
 """
 
 _FIELDS = [
@@ -276,6 +283,28 @@ class Store:
             d["q1"], d["median"], d["q3"], d["n"] = (
                 r["q1"], r["median"], r["q3"], r["n"])
         return list(by_day.values())
+
+    def add_subscription(self, sub: dict[str, Any]) -> None:
+        keys = sub.get("keys") or {}
+        self.conn.execute(
+            "INSERT OR REPLACE INTO push_subscriptions "
+            "(endpoint, p256dh, auth, created) VALUES (?, ?, ?, ?)",
+            (sub["endpoint"], keys.get("p256dh"), keys.get("auth"), _now()),
+        )
+        self.conn.commit()
+
+    def remove_subscription(self, endpoint: str) -> None:
+        self.conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+        self.conn.commit()
+
+    def all_subscriptions(self) -> list[dict[str, Any]]:
+        """In the shape pywebpush expects: {endpoint, keys:{p256dh, auth}}."""
+        rows = self.conn.execute(
+            "SELECT endpoint, p256dh, auth FROM push_subscriptions").fetchall()
+        return [{"endpoint": r["endpoint"],
+                 "keys": {"p256dh": r["p256dh"], "auth": r["auth"]}}
+                for r in rows]
 
     def record_run(self, search_key: str, ok: bool, duration_ms: int,
                    result: "SyncResult | None" = None,

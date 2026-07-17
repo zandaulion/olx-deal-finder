@@ -3,6 +3,9 @@
 *.db-journal
 *.db-wal
 
+# VAPID private key for web-push (secret; generated on first run)
+vapid_key.pem
+
 # Python
 __pycache__/
 *.py[cod]

@@ -48,7 +48,7 @@ MANIFEST = {
 
 # Network-first so live data stays fresh; falls back to cache (offline shell).
 SW_JS = """
-const CACHE = 'olx-deals-v1';
+const CACHE = 'olx-deals-v2';
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/manifest.webmanifest'])));
   self.skipWaiting();
@@ -69,10 +69,30 @@ self.addEventListener('fetch', (e) => {
     }).catch(() => caches.match(req).then((r) => r || caches.match('/')))
   );
 });
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) {}
+  e.waitUntil(self.registration.showNotification(d.title || 'OLX Deals', {
+    body: d.body || '',
+    icon: '/static/icon-192.png',
+    badge: '/static/icon-192.png',
+    tag: d.tag || 'olx-deal',
+    data: { url: d.url || '/' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/';
+  e.waitUntil(clients.matchAll({ type: 'window' }).then((wins) => {
+    for (const w of wins) { if ('focus' in w) { w.navigate(url); return w.focus(); } }
+    if (clients.openWindow) return clients.openWindow(url);
+  }));
+});
 """
 
 from . import config
 from .discover import discover
+from .push import Push
 from .scorer import EUR_TO_RON, score_search, to_ron
 from .store import Store
 
@@ -205,6 +225,7 @@ _SHELL = """<!doctype html>
     <form method="post" action="/sync" style="margin:0">
       <button class="btn btn-go" type="submit">Sync now</button>
     </form>
+    <button class="btn" type="button" onclick="enableNotifs()">&#128276; Alerts</button>
   </nav>
 </header>
 {flash}
@@ -282,6 +303,40 @@ document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
 // Register the service worker (only in a secure context — HTTPS/localhost).
 if ('serviceWorker' in navigator && window.isSecureContext) {{
   navigator.serviceWorker.register('/sw.js').catch(function() {{}});
+}}
+
+function urlB64ToUint8(b64) {{
+  var pad = '='.repeat((4 - b64.length % 4) % 4);
+  var s = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  var raw = atob(s), arr = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}}
+async function enableNotifs() {{
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+    alert('This browser does not support push notifications.'); return;
+  }}
+  if (!window.isSecureContext) {{
+    alert('Open the app via its HTTPS address (…ts.net:8443) to enable alerts.');
+    return;
+  }}
+  try {{
+    var perm = await Notification.requestPermission();
+    if (perm !== 'granted') {{ alert('Notifications were not allowed.'); return; }}
+    var reg = await navigator.serviceWorker.ready;
+    var key = (await (await fetch('/push/public-key')).json()).key;
+    var sub = await reg.pushManager.subscribe({{
+      userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key)
+    }});
+    await fetch('/push/subscribe', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(sub)
+    }});
+    await fetch('/push/test', {{method: 'POST'}});  // immediate confirmation push
+    alert('Deal alerts enabled — you should see a test notification.');
+  }} catch (err) {{
+    alert('Could not enable alerts: ' + err);
+  }}
 }}
 </script>
 </body></html>"""
@@ -967,6 +1022,7 @@ def build_search(form: dict[str, str]) -> dict:
 class Handler(BaseHTTPRequestHandler):
     db_path = "olxdeals.db"
     config_path = "searches.yaml"
+    push: "Push" = None  # set in main()
 
     def _html(self, body: str, status: int = 200) -> None:
         data = body.encode("utf-8")
@@ -1013,6 +1069,30 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
+    def _json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _send_test_push(self) -> None:
+        store = Store(self.db_path)
+        try:
+            subs = store.all_subscriptions()
+            dead = self.push.notify_all(subs, {
+                "title": "OLX Deals",
+                "body": "Alerts are on. You'll be notified of new deals.",
+                "url": "/",
+                "tag": "olx-test",
+            })
+            for ep in dead:
+                store.remove_subscription(ep)
+        finally:
+            store.close()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -1053,6 +1133,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._json({"categories": cats, "models": models})
+        elif parsed.path == "/push/public-key":
+            self._json({"key": self.push.public_key_b64()})
         elif parsed.path == "/manifest.webmanifest":
             self._raw(json.dumps(MANIFEST).encode("utf-8"),
                       "application/manifest+json")
@@ -1109,6 +1191,30 @@ class Handler(BaseHTTPRequestHandler):
                         store.close()
                 self.send_response(204)  # async star / seen toggle
                 self.end_headers()
+            elif parsed.path == "/push/subscribe":
+                sub = self._json_body()
+                if sub.get("endpoint"):
+                    store = Store(self.db_path)
+                    try:
+                        store.add_subscription(sub)
+                    finally:
+                        store.close()
+                self.send_response(204)
+                self.end_headers()
+            elif parsed.path == "/push/unsubscribe":
+                sub = self._json_body()
+                if sub.get("endpoint"):
+                    store = Store(self.db_path)
+                    try:
+                        store.remove_subscription(sub["endpoint"])
+                    finally:
+                        store.close()
+                self.send_response(204)
+                self.end_headers()
+            elif parsed.path == "/push/test":
+                self._send_test_push()
+                self.send_response(204)
+                self.end_headers()
             elif parsed.path == "/sync":
                 self._trigger_sync()
                 self._redirect("/?msg=" + urllib.parse.quote(
@@ -1148,6 +1254,8 @@ def main() -> None:
 
     Handler.db_path = args.db
     Handler.config_path = args.config
+    # VAPID key lives next to the DB so the sync process finds the same one.
+    Handler.push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"OLX dashboard on http://{args.host}:{args.port}/  (Ctrl-C to stop)")
     try:

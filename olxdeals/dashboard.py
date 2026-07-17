@@ -255,10 +255,10 @@ _SHELL = """<!doctype html>
 {flash}
 {content}
 <nav class="tabbar">
-  <a href="/" class="{deals_active}"><span class="ic">&#127991;</span>Deals</a>
-  <a href="/drops" class="{drops_active}"><span class="ic">&#128201;</span>Drops</a>
+  <a href="{deals_href}" class="{deals_active}"><span class="ic">&#127991;</span>Deals</a>
+  <a href="{drops_href}" class="{drops_active}"><span class="ic">&#128201;</span>Drops</a>
   <a href="/saved" class="{saved_active}"><span class="ic">&#9733;</span>Saved</a>
-  <a href="/history" class="{trends_active}"><span class="ic">&#128202;</span>Trends</a>
+  <a href="{trends_href}" class="{trends_active}"><span class="ic">&#128202;</span>Trends</a>
   <a href="/searches" class="{manage_active}"><span class="ic">&#9881;</span>Manage</a>
 </nav>
 <script>
@@ -373,6 +373,29 @@ async function enableNotifs() {{
 </body></html>"""
 
 
+# Remember the last query (selected search + filters) per view, so the bottom
+# tabs restore where you left off. Single-user local app -> a module dict is fine.
+_LAST_QUERY: dict[str, str] = {}
+_REMEMBER_KEYS = {
+    "/": ["search", "sort", "seller", "pmin", "pmax", "hide_seen"],
+    "/drops": ["search"],
+    "/history": ["search"],
+}
+
+
+def _remember(path: str, qs: dict) -> None:
+    keys = _REMEMBER_KEYS.get(path)
+    if keys is None:
+        return
+    parts = [(k, qs[k][0]) for k in keys if qs.get(k, [""])[0] not in ("", None)]
+    _LAST_QUERY[path] = urllib.parse.urlencode(parts)
+
+
+def _tab_href(path: str) -> str:
+    q = _LAST_QUERY.get(path, "")
+    return f"{path}?{q}" if q else path
+
+
 def _time_ago(iso: str | None) -> str:
     if not iso:
         return "never"
@@ -428,6 +451,9 @@ def _shell(sub: str, content: str, active: str, flash: str = "") -> str:
     flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
     return _SHELL.format(
         css=_CSS, sub=sub, content=content, flash=flash_html,
+        deals_href=_tab_href("/"),
+        drops_href=_tab_href("/drops"),
+        trends_href=_tab_href("/history"),
         deals_active="active" if active == "deals" else "",
         drops_active="active" if active == "drops" else "",
         saved_active="active" if active == "saved" else "",
@@ -1216,6 +1242,8 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
         flash = qs.get("msg", [""])[0]
         selected = qs.get("search", [None])[0]
+        # Remember selected search + filters per view so the tabs restore them.
+        _remember("/" if parsed.path == "/index.html" else parsed.path, qs)
         if parsed.path in ("/", "/index.html"):
             filters = {
                 "sort": qs.get("sort", ["deal"])[0],
@@ -1335,7 +1363,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             elif parsed.path == "/sync":
                 self._trigger_sync()
-                self._redirect("/?msg=" + urllib.parse.quote(
+                # Return to the Deals view with its remembered search + filters.
+                base = _tab_href("/")
+                sep = "&" if "?" in base else "?"
+                self._redirect(base + sep + "msg=" + urllib.parse.quote(
                     "Sync started — refresh in ~30s to see results."))
             else:
                 self.send_error(404)

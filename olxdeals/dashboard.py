@@ -100,18 +100,39 @@ _CSS = """
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
-         background:#0f1115; color:#e6e6e6; }
-  header { padding:12px 16px; background:#161a20; position:sticky; top:0;
-           border-bottom:1px solid #262c36; z-index:5; }
+         background:#0f1115; color:#e6e6e6;
+         padding-bottom:calc(60px + env(safe-area-inset-bottom)); }
+  header { padding:10px 16px; background:#161a20; position:sticky; top:0;
+           border-bottom:1px solid #262c36; z-index:5;
+           padding-top:calc(10px + env(safe-area-inset-top)); }
   header h1 { margin:0; font-size:18px; }
-  header .sub { color:#8a93a2; font-size:12px; margin-top:2px; }
-  nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
-  nav a, .btn { display:inline-block; padding:6px 12px; border-radius:8px;
+  header .sub { color:#8a93a2; font-size:12px; margin-top:3px; }
+  .topbar { display:flex; align-items:center; justify-content:space-between; }
+  .topbar form { margin:0; }
+  .actions { display:flex; gap:8px; }
+  .iconbtn { background:#20252e; border:1px solid #2c333f; color:#cbd3df;
+        width:40px; height:40px; border-radius:10px; font-size:19px; cursor:pointer;
+        display:flex; align-items:center; justify-content:center; padding:0; }
+  .iconbtn:active { background:#2c333f; }
+  .btn { display:inline-block; padding:6px 12px; border-radius:8px;
         font-size:13px; text-decoration:none; background:#20252e; color:#cbd3df;
         border:1px solid #2c333f; cursor:pointer; }
-  nav a.active { background:#2f5fd0; color:#fff; border-color:#2f5fd0; }
   .btn-go { background:#1e5f3c; color:#c9f5d9; border-color:#1e5f3c; }
   .btn-del { background:#4a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
+  .tabbar { position:fixed; left:0; right:0; bottom:0; z-index:10; display:flex;
+        background:#161a20; border-top:1px solid #262c36;
+        padding-bottom:env(safe-area-inset-bottom); }
+  .tabbar a { flex:1; display:flex; flex-direction:column; align-items:center;
+        gap:2px; padding:7px 2px 8px; color:#8a93a2; text-decoration:none;
+        font-size:10px; }
+  .tabbar a .ic { font-size:19px; line-height:1.1; }
+  .tabbar a.active { color:#4f8bff; }
+  .filterbox { margin:8px 16px 0; }
+  .filterbox > summary { list-style:none; cursor:pointer; color:#8a93a2;
+        font-size:13px; padding:5px 0; display:flex; align-items:center; gap:6px; }
+  .filterbox > summary::-webkit-details-marker { display:none; }
+  .filterbox > summary::before { content:'\\25B8'; font-size:11px; }
+  .filterbox[open] > summary::before { content:'\\25BE'; }
   .search { padding:10px 16px 4px; font-size:13px; color:#8a93a2; }
   .search b { color:#cbd3df; }
   .menu { margin:10px 16px 0; }
@@ -147,7 +168,7 @@ _CSS = """
           border:1px solid #2c333f; border-radius:6px; padding:2px 9px; }
   .seen-btn.on { color:#8fd0a0; border-color:#2f5f3c; }
   .b-new { background:#123a3a; color:#a6eaea; }
-  .controls { margin:8px 16px 0; display:flex; flex-wrap:wrap; gap:8px;
+  .controls { margin:6px 0 2px; display:flex; flex-wrap:wrap; gap:8px;
           align-items:center; font-size:13px; color:#8a93a2; }
   .controls select, .controls input { background:#0f1115; color:#e6e6e6;
           border:1px solid #2c333f; border-radius:6px; padding:5px 7px; font-size:13px; }
@@ -214,22 +235,27 @@ _SHELL = """<!doctype html>
 <link rel="icon" type="image/png" href="/static/icon-192.png">
 <style>{css}</style></head><body>
 <header>
-  <h1>OLX Deals</h1>
+  <div class="topbar">
+    <h1>OLX Deals</h1>
+    <div class="actions">
+      <form method="post" action="/sync">
+        <button class="iconbtn" type="submit" title="Sync now">&#8635;</button>
+      </form>
+      <button class="iconbtn" type="button" onclick="enableNotifs()"
+              title="Enable deal alerts">&#128276;</button>
+    </div>
+  </div>
   <div class="sub">{sub}</div>
-  <nav>
-    <a href="/" class="{deals_active}">Deals</a>
-    <a href="/drops" class="{drops_active}">Drops</a>
-    <a href="/saved" class="{saved_active}">★ Saved</a>
-    <a href="/history" class="{trends_active}">Trends</a>
-    <a href="/searches" class="{manage_active}">Manage</a>
-    <form method="post" action="/sync" style="margin:0">
-      <button class="btn btn-go" type="submit">Sync now</button>
-    </form>
-    <button class="btn" type="button" onclick="enableNotifs()">&#128276; Alerts</button>
-  </nav>
 </header>
 {flash}
 {content}
+<nav class="tabbar">
+  <a href="/" class="{deals_active}"><span class="ic">&#127991;</span>Deals</a>
+  <a href="/drops" class="{drops_active}"><span class="ic">&#128201;</span>Drops</a>
+  <a href="/saved" class="{saved_active}"><span class="ic">&#9733;</span>Saved</a>
+  <a href="/history" class="{trends_active}"><span class="ic">&#128202;</span>Trends</a>
+  <a href="/searches" class="{manage_active}"><span class="ic">&#9881;</span>Manage</a>
+</nav>
 <script>
 // On Android, rewrite listing links to open the OLX app (ro.mercador),
 // falling back to the web page if the app isn't installed.
@@ -544,14 +570,18 @@ def _menu(keys: list[str], base: str, selected: str | None) -> str:
 
 
 def _controls_bar(selected: str | None, f: dict) -> str:
-    """Sort/filter control bar; a GET form that reloads with query params."""
+    """Sort/filter controls, collapsed behind a 'Filters' toggle.
+    Opens by default only when a non-default filter is active."""
     def opt(name, value, label):
         sel = "selected" if f.get(name) == value else ""
         return f'<option value="{value}" {sel}>{label}</option>'
     hidden = (f'<input type="hidden" name="search" value="{html.escape(selected)}">'
               if selected else "")
     checked = "checked" if f.get("hide_seen") else ""
-    return f"""<form class="controls" method="get" action="/">{hidden}
+    active = (f.get("sort", "deal") != "deal" or f.get("seller", "all") != "all"
+              or f.get("pmin") or f.get("pmax") or f.get("hide_seen"))
+    summary = "Filters" + (" · active" if active else "")
+    form = f"""<form class="controls" method="get" action="/">{hidden}
   Sort <select name="sort">
     {opt('sort','deal','deal %')}{opt('sort','price_asc','price ↑')}
     {opt('sort','price_desc','price ↓')}{opt('sort','newest','newest')}
@@ -566,6 +596,8 @@ def _controls_bar(selected: str | None, f: dict) -> str:
   <label><input type="checkbox" name="hide_seen" value="1" {checked}> hide seen</label>
   <button class="apply" type="submit">Apply</button>
 </form>"""
+    return (f'<details class="filterbox" {"open" if active else ""}>'
+            f'<summary>{summary}</summary>{form}</details>')
 
 
 def render_deals(db_path: str, config_path: str, selected: str | None = None,

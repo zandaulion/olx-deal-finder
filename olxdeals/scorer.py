@@ -22,12 +22,17 @@ from typing import Any, Iterable
 # Rough EUR->RON; refresh occasionally. Kept here so it's easy to config later.
 EUR_TO_RON = 4.98
 
-# Title words that mark a listing as not a clean, working phone.
+# Title words that mark a listing as not a clean, comparable item.
 JUNK_KEYWORDS = (
+    # phones / electronics
     "defect", "defecta", "piese", "piesa", "dezmembr", "display",
     "carcasa", "carcasă", "doar ecran", "doar sticla", "spart", "sparta",
     "husa", "husă", "folie", "incarcator", "încărcător", "cablu",
     "nefunctional", "nefuncțional", "pentru piese", "placa de baza",
+    # vehicles: damaged cars and parts/accessories aren't comparable deals
+    "avariat", "avariata", "avariate", "lovit", "lovita", "daune", "daunat",
+    "jante", "anvelope", "mp3", "navigatie casetofon", "bord ", "planetara",
+    "electromotor", "cutie de viteze", "set piese",
 )
 
 DEAL_THRESHOLD = 0.20     # must be >=20% under the clean median

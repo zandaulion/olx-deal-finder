@@ -43,7 +43,10 @@ class SearchSpec:
     category_id: int = 0
     query: str | None = None
     filters: dict[str, Any] = field(default_factory=dict)
-    # e.g. {"model": ["iphone_13"], "state": ["used"]}
+    # enum filters, e.g. {"model": ["iphone_13"], "petrol": ["diesel"]}
+    ranges: dict[str, dict] = field(default_factory=dict)
+    # numeric range filters, e.g. {"year": {"from": 2017, "to": 2020},
+    #                              "rulaj_pana": {"to": 200000}}
     price_from: int | None = None
     price_to: int | None = None
     region_id: int | None = None
@@ -64,6 +67,11 @@ class SearchSpec:
             params.append(("filter_float_price:from", str(self.price_from)))
         if self.price_to is not None:
             params.append(("filter_float_price:to", str(self.price_to)))
+        for name, bounds in self.ranges.items():
+            if bounds.get("from") is not None:
+                params.append((f"filter_float_{name}:from", str(bounds["from"])))
+            if bounds.get("to") is not None:
+                params.append((f"filter_float_{name}:to", str(bounds["to"])))
         if self.region_id is not None:
             params.append(("region_id", str(self.region_id)))
         return params

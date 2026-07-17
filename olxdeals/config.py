@@ -50,6 +50,7 @@ def load_searches(path: str | Path) -> list[SearchSpec]:
                 category_id=raw.get("category_id", 0),
                 query=raw.get("query"),
                 filters=raw.get("filters", {}) or {},
+                ranges=raw.get("ranges", {}) or {},
                 price_from=raw.get("price_from"),
                 price_to=raw.get("price_to"),
                 region_id=raw.get("region_id"),

@@ -667,6 +667,9 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         # --- filters ---
         def keep(sl) -> bool:
             r = sl.raw
+            # Drop 0-price / price-less junk (common on car listings).
+            if sl.price_ron is None or sl.price_ron <= 0:
+                return False
             if seller == "private" and r.get("is_business"):
                 return False
             if seller == "dealer" and not r.get("is_business"):
@@ -899,14 +902,25 @@ def render_searches(config_path: str, db_path: str, edit_key: str | None = None,
         v = editing.get(key)
         return "" if v is None else html.escape(str(v))
 
-    ed_model = ed_state = ""
+    ed_model = ed_state = ed_fuel = ed_gear = ""
+    ed_yfrom = ed_yto = ed_mileage = ""
     if editing:
         f = editing.get("filters") or {}
         ed_model = html.escape((f.get("model") or [""])[0])
         ed_state = (f.get("state") or [""])[0]
+        ed_fuel = (f.get("petrol") or [""])[0]
+        ed_gear = (f.get("gearbox") or [""])[0]
+        rng = editing.get("ranges") or {}
+        yr = rng.get("year") or {}
+        ed_yfrom = yr.get("from") or ""
+        ed_yto = yr.get("to") or ""
+        ed_mileage = (rng.get("rulaj_pana") or {}).get("to") or ""
 
     def sel(v):
         return "selected" if ed_state == v else ""
+
+    def selo(current, v):
+        return "selected" if current == v else ""
 
     discover_panel = """<div class="mng">
   <label>Find model key &amp; category id (searches OLX live)</label>
@@ -975,6 +989,36 @@ function setModel(k){
   </div>
   <label>Region id (optional)</label>
   <input name="region_id" value="{val('region_id')}" inputmode="numeric">
+  <details style="margin-top:10px" {'open' if (ed_yfrom or ed_yto or ed_mileage or ed_fuel or ed_gear) else ''}>
+    <summary style="cursor:pointer;color:#8a93a2;font-size:13px">Vehicle filters (optional)</summary>
+    <div class="row2">
+      <div><label>Year from</label>
+        <input name="year_from" value="{ed_yfrom}" inputmode="numeric" placeholder="2017"></div>
+      <div><label>Year to</label>
+        <input name="year_to" value="{ed_yto}" inputmode="numeric" placeholder="2020"></div>
+    </div>
+    <label>Max mileage (km)</label>
+    <input name="mileage_to" value="{ed_mileage}" inputmode="numeric" placeholder="200000">
+    <div class="row2">
+      <div><label>Fuel</label>
+        <select name="fuel">
+          <option value="">any</option>
+          <option value="diesel" {selo(ed_fuel,'diesel')}>Diesel</option>
+          <option value="petrol" {selo(ed_fuel,'petrol')}>Benzină</option>
+          <option value="hybrid" {selo(ed_fuel,'hybrid')}>Hibrid</option>
+          <option value="lpg" {selo(ed_fuel,'lpg')}>GPL</option>
+          <option value="electric" {selo(ed_fuel,'electric')}>Electric</option>
+        </select></div>
+      <div><label>Gearbox</label>
+        <select name="gearbox">
+          <option value="">any</option>
+          <option value="automatic" {selo(ed_gear,'automatic')}>Automată</option>
+          <option value="manual" {selo(ed_gear,'manual')}>Manuală</option>
+        </select></div>
+    </div>
+    <div class="note" style="margin:6px 0 0">For cars: narrow year + mileage so the
+      median compares like-for-like. Leave blank for phones.</div>
+  </details>
   <div style="margin-top:12px; display:flex; gap:10px;">
     <button class="btn btn-go" type="submit">
       {'Save changes' if editing else 'Add search'}</button>
@@ -1060,8 +1104,25 @@ def build_search(form: dict[str, str]) -> dict:
     state = form.get("state", "").strip()
     if state in ("used", "new"):
         filters["state"] = [state]
+    fuel = form.get("fuel", "").strip()
+    if fuel:
+        filters["petrol"] = [fuel]  # OLX enum name for fuel type
+    gearbox = form.get("gearbox", "").strip()
+    if gearbox:
+        filters["gearbox"] = [gearbox]
     if filters:
         s["filters"] = filters
+    # Numeric range filters (vehicles): year, mileage.
+    ranges: dict = {}
+    yf, yt = _int_or_none(form.get("year_from")), _int_or_none(form.get("year_to"))
+    if yf is not None or yt is not None:
+        ranges["year"] = {k: v for k, v in (("from", yf), ("to", yt))
+                          if v is not None}
+    mt = _int_or_none(form.get("mileage_to"))
+    if mt is not None:
+        ranges["rulaj_pana"] = {"to": mt}
+    if ranges:
+        s["ranges"] = ranges
     query = form.get("query", "").strip()
     if query:
         s["query"] = query

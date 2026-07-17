@@ -21,6 +21,7 @@ import re
 import subprocess
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from . import config
 from .discover import discover
@@ -222,7 +223,7 @@ def _sparkline(series: list[float], w: int = 130, h: int = 28) -> str:
             f'points="{" ".join(pts)}"/></svg>')
 
 
-def _card(sl, history: list | None = None) -> str:
+def _card(sl, history: list | None = None, search_label: str | None = None) -> str:
     r = sl.raw
     title = html.escape(r.get("title") or "—")
     url = html.escape(r.get("url") or "#")
@@ -246,6 +247,9 @@ def _card(sl, history: list | None = None) -> str:
     if pp is not None and r.get("price") is not None and pp > r["price"]:
         badges += '<span class="badge b-drop">price drop</span>'
     city = html.escape(r.get("city") or "")
+    if search_label:
+        city = (f'{city} · ' if city else '') + \
+               f'<span style="color:#6b7280">{html.escape(search_label)}</span>'
 
     # Price history: sparkline + "was X (−Y%)" when the price has fallen.
     series = _ron_series(history)
@@ -311,10 +315,13 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                  flash: str = "") -> str:
     all_keys = _search_keys(config_path, db_path)
     show = [selected] if selected in all_keys else all_keys
+    viewing_all = selected not in all_keys
     store = Store(db_path)
     try:
-        blocks: list[str] = []
+        summary_blocks: list[str] = []
         total_deals = 0
+        # (search_key, ScoredListing, history) across every shown search.
+        pool: list[tuple[str, Any, list | None]] = []
         for key in show:
             active = store.active_for_search(key)
             sd = score_search(key, active)
@@ -324,18 +331,28 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             med = f"{sd.median:.0f} RON" if sd.median else "—"
             susp = len(sd.suspicious)
             susp_txt = f" · {susp} too-cheap" if susp else ""
-            blocks.append(
+            summary_blocks.append(
                 f'<div class="search"><b>{html.escape(key)}</b> · '
                 f'{len(active)} active · median {med} · '
                 f'{len(deals)} deal(s){susp_txt}</div>')
             if not active:
-                blocks.append('<div class="note" style="margin:0 16px 8px">'
-                              'No active listings — try Sync now.</div>')
+                summary_blocks.append(
+                    '<div class="note" style="margin:0 16px 8px">'
+                    'No active listings — try Sync now.</div>')
                 continue
             shown = deals + [l for l in sd.listings if not l.is_deal][:20]
-            blocks.append("".join(
-                _card(l, hist.get(l.raw["id"])) for l in shown))
-        body = "".join(blocks) or \
+            for l in shown:
+                pool.append((key, l, hist.get(l.raw["id"])))
+
+        if viewing_all:
+            # Flatten and rank by deal % across every search, best first.
+            pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
+            cards = "".join(_card(l, h, search_label=key) for key, l, h in pool)
+        else:
+            # Single search: score_search already sorted these by deal %.
+            cards = "".join(_card(l, h) for _, l, h in pool)
+
+        body = "".join(summary_blocks) + cards or \
             '<div class="empty">No searches yet. Add one on Manage, then Sync now.</div>'
         content = _menu(all_keys, "/", selected) + body
         scope = f"'{selected}'" if selected else f"{len(all_keys)} search(es)"

@@ -146,10 +146,15 @@ _CSS = """
   .menu[open] > summary .caret { transform:rotate(180deg); }
   .menu .items { margin-top:6px; border:1px solid #2c333f; border-radius:8px;
           overflow:hidden; }
-  .menu .items a { display:block; padding:11px 12px; color:#cbd3df;
-          text-decoration:none; border-bottom:1px solid #20252e; font-size:14px; }
+  .menu .items a { display:flex; justify-content:space-between; align-items:center;
+          gap:10px; padding:11px 12px; color:#cbd3df; text-decoration:none;
+          border-bottom:1px solid #20252e; font-size:14px; }
   .menu .items a:last-child { border-bottom:none; }
   .menu .items a.on { background:#2f5fd0; color:#fff; }
+  .menu .items a .stat { color:#8a93a2; font-size:12px; white-space:nowrap; }
+  .menu .items a.on .stat { color:#cdd9ff; }
+  .menu .sstat { color:#8a93a2; font-size:12px; margin-left:6px; }
+  .menu .dl { color:#5fd08a; }
   .card { display:flex; gap:12px; margin:10px 16px; padding:10px; position:relative;
           background:#161a20; border:1px solid #262c36; border-radius:12px;
           -webkit-touch-callout:none; }
@@ -551,20 +556,30 @@ def _search_keys(config_path: str, db_path: str) -> list[str]:
     return keys
 
 
-def _menu(keys: list[str], base: str, selected: str | None) -> str:
-    """Hamburger dropdown: current selection + a list of all searches."""
+def _menu(keys: list[str], base: str, selected: str | None,
+          stats: dict[str, str] | None = None, totals: str = "") -> str:
+    """Hamburger dropdown: current selection + a list of all searches, each
+    with its stat (active count · deal count) on the right when provided."""
     if not keys:
         return ""
     current = selected if selected in keys else None
-    label = html.escape(current) if current else "All searches"
-    items = [f'<a href="{base}" class="{"" if current else "on"}">All searches</a>']
+    stats = stats or {}
+
+    def item(href: str, name: str, on: bool, stat: str) -> str:
+        right = f'<span class="stat">{stat}</span>' if stat else ""
+        return (f'<a href="{href}" class="{"on" if on else ""}">'
+                f'<span>{name}</span>{right}</a>')
+
+    items = [item(base, "All searches", not current, totals)]
     for k in keys:
-        on = "on" if k == current else ""
-        items.append(
-            f'<a href="{base}?search={urllib.parse.quote(k)}" class="{on}">'
-            f'{html.escape(k)}</a>')
+        items.append(item(f"{base}?search={urllib.parse.quote(k)}",
+                          html.escape(k), k == current, stats.get(k, "")))
+
+    label = html.escape(current) if current else "All searches"
+    summary_stat = stats.get(current, "") if current else totals
+    sfx = f'<span class="sstat">· {summary_stat}</span>' if summary_stat else ""
     return (f'<details class="menu"><summary>'
-            f'<span class="burger">&#9776;</span>{label}'
+            f'<span class="burger">&#9776;</span>{label}{sfx}'
             f'<span class="caret">&#9662;</span></summary>'
             f'<div class="items">{"".join(items)}</div></details>')
 
@@ -613,32 +628,41 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
     viewing_all = selected not in all_keys
     store = Store(db_path)
     try:
-        summary_blocks: list[str] = []
-        total_deals = 0
+        menu_stats: dict[str, str] = {}
+        total_deals = total_active = shown_deals = 0
+        sel_header = ""
         # (search_key, ScoredListing, history) across every shown search.
         pool: list[tuple[str, Any, list | None]] = []
-        for key in show:
+        # Score every search (cheap) so the dropdown can show per-search stats;
+        # only pool listings for the search(es) actually being shown.
+        for key in all_keys:
             active = store.active_for_search(key)
             sd = score_search(key, active)
-            hist = store.histories([l.raw["id"] for l in sd.listings])
-            deals = sd.deals
-            total_deals += len(deals)
-            med = f"{sd.median:.0f} RON" if sd.median else "—"
-            susp = len(sd.suspicious)
-            susp_txt = f" · {susp} too-cheap" if susp else ""
-            summary_blocks.append(
-                f'<div class="search"><b>{html.escape(key)}</b> · '
-                f'{len(active)} active · median {med} · '
-                f'{len(deals)} deal(s){susp_txt}</div>')
-            if not active:
-                summary_blocks.append(
-                    '<div class="note" style="margin:0 16px 8px">'
-                    'No active listings — try Sync now.</div>')
+            ndeals = len(sd.deals)
+            total_deals += ndeals
+            total_active += len(active)
+            menu_stats[key] = (f'{len(active)} · '
+                               f'<span class="dl">{ndeals}&#9670;</span>')
+            if key not in show:
                 continue
-            # Include every listing; filtering/sorting/capping happen below so
-            # the sort controls see the whole set, not a deal-score subset.
+            shown_deals += ndeals
+            hist = store.histories([l.raw["id"] for l in sd.listings])
             for l in sd.listings:
                 pool.append((key, l, hist.get(l.raw["id"])))
+            if not viewing_all:  # single search: one compact header line
+                med = f"{sd.median:.0f} RON" if sd.median else "—"
+                susp = len(sd.suspicious)
+                susp_txt = f" · {susp} too-cheap" if susp else ""
+                if active:
+                    sel_header = (
+                        f'<div class="search"><b>{html.escape(key)}</b> · '
+                        f'{len(active)} active · median {med} · '
+                        f'{ndeals} deal(s){susp_txt}</div>')
+                else:
+                    sel_header = ('<div class="note" style="margin:8px 16px 0">'
+                                  'No active listings — try Sync now.</div>')
+        totals_str = (f'{total_active} · '
+                      f'<span class="dl">{total_deals}&#9670;</span>')
 
         # --- filters ---
         def keep(sl) -> bool:
@@ -672,12 +696,13 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         cards = "".join(
             _card(l, h, search_label=key if viewing_all else None)
             for key, l, h in pool)
-        body = "".join(summary_blocks) + cards or \
+        body = sel_header + cards or \
             '<div class="empty">No searches yet. Add one on Manage, then Sync now.</div>'
-        content = (_sync_banner(store) + _menu(all_keys, "/", selected)
+        content = (_sync_banner(store)
+                   + _menu(all_keys, "/", selected, menu_stats, totals_str)
                    + _controls_bar(selected, f) + body)
-        scope = f"'{selected}'" if selected else f"{len(all_keys)} search(es)"
-        sub = (f"{scope} · {total_deals} deal(s) · {_last_sync_text(store)} · "
+        scope = f"'{selected}'" if not viewing_all else f"{len(all_keys)} search(es)"
+        sub = (f"{scope} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
                f"EUR→RON {EUR_TO_RON}")
     finally:
         store.close()

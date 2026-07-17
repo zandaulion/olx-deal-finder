@@ -17,12 +17,59 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import mimetypes
 import re
 import subprocess
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+# --- Progressive Web App: manifest + service worker (installable full-screen) ---
+MANIFEST = {
+    "name": "OLX Deals",
+    "short_name": "OLX Deals",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0f1115",
+    "theme_color": "#0f1115",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192",
+         "type": "image/png", "purpose": "any maskable"},
+        {"src": "/static/icon-512.png", "sizes": "512x512",
+         "type": "image/png", "purpose": "any maskable"},
+    ],
+}
+
+# Network-first so live data stays fresh; falls back to cache (offline shell).
+SW_JS = """
+const CACHE = 'olx-deals-v1';
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/manifest.webmanifest'])));
+  self.skipWaiting();
+});
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((ks) =>
+    Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  e.respondWith(
+    fetch(req).then((res) => {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+      return res;
+    }).catch(() => caches.match(req).then((r) => r || caches.match('/')))
+  );
+});
+"""
 
 from . import config
 from .discover import discover
@@ -135,8 +182,16 @@ _CSS = """
 _SHELL = """<!doctype html>
 <html lang="ro"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OLX Deals</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0f1115">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OLX Deals">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="icon" type="image/png" href="/static/icon-192.png">
 <style>{css}</style></head><body>
 <header>
   <h1>OLX Deals</h1>
@@ -223,6 +278,11 @@ document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
     if (fired) {{ e.preventDefault(); fired = false; }}
   }});
 }});
+
+// Register the service worker (only in a secure context — HTTPS/localhost).
+if ('serviceWorker' in navigator && window.isSecureContext) {{
+  navigator.serviceWorker.register('/sw.js').catch(function() {{}});
+}}
 </script>
 </body></html>"""
 
@@ -924,6 +984,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _raw(self, data: bytes, ctype: str, extra: dict | None = None) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _static(self, path: str) -> None:
+        name = Path(path).name  # basename only — no directory traversal
+        fp = STATIC_DIR / name
+        if not fp.is_file():
+            self.send_error(404)
+            return
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        self._raw(fp.read_bytes(), ctype,
+                  {"Cache-Control": "public, max-age=86400"})
+
     def _redirect(self, location: str) -> None:
         self.send_response(303)
         self.send_header("Location", location)
@@ -974,6 +1053,14 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._json({"categories": cats, "models": models})
+        elif parsed.path == "/manifest.webmanifest":
+            self._raw(json.dumps(MANIFEST).encode("utf-8"),
+                      "application/manifest+json")
+        elif parsed.path == "/sw.js":
+            self._raw(SW_JS.encode("utf-8"), "application/javascript",
+                      {"Service-Worker-Allowed": "/"})
+        elif parsed.path.startswith("/static/"):
+            self._static(parsed.path)
         else:
             self.send_error(404)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -62,7 +63,16 @@ class SearchSpec:
         if self.query:
             params.append(("query", self.query))
         for name, values in self.filters.items():
-            for i, value in enumerate(values):
+            vals = list(values)
+            # OLX silently drops an enum filter given >1 value (returns
+            # everything). Keep only the first and warn, so a stray second
+            # value can't quietly widen the search to the whole category.
+            if len(vals) > 1:
+                print(f"[olxdeals] filter '{name}' has multiple values "
+                      f"{vals}; OLX ignores multi-value enums — using only "
+                      f"'{vals[0]}'.", file=sys.stderr)
+                vals = vals[:1]
+            for i, value in enumerate(vals):
                 params.append((f"filter_enum_{name}[{i}]", str(value)))
         if self.price_from is not None:
             params.append(("filter_float_price:from", str(self.price_from)))

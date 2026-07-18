@@ -1148,7 +1148,7 @@ def render_searches(config_path: str, db_path: str, edit_key: str | None = None,
         v = editing.get(key)
         return "" if v is None else html.escape(str(v))
 
-    ed_model = ed_state = ed_fuel = ed_gear = ""
+    ed_model = ed_state = ed_fuel = ed_gear = ed_wheel = ed_brand = ""
     ed_yfrom = ed_yto = ed_mileage = ""
     if editing:
         f = editing.get("filters") or {}
@@ -1156,6 +1156,8 @@ def render_searches(config_path: str, db_path: str, edit_key: str | None = None,
         ed_state = (f.get("state") or [""])[0]
         ed_fuel = (f.get("petrol") or [""])[0]
         ed_gear = (f.get("gearbox") or [""])[0]
+        ed_wheel = (f.get("dimensiune_roata") or [""])[0]
+        ed_brand = (f.get("brand") or [""])[0]
         rng = editing.get("ranges") or {}
         yr = rng.get("year") or {}
         ed_yfrom = yr.get("from") or ""
@@ -1268,6 +1270,36 @@ function setModel(k){
     <div class="note" style="margin:6px 0 0">For cars: narrow year + mileage so the
       median compares like-for-like. Leave blank for phones.</div>
   </details>
+  <details style="margin-top:10px" {'open' if (ed_wheel or ed_brand) else ''}>
+    <summary style="cursor:pointer;color:#8a93a2;font-size:13px">Bike filters (optional)</summary>
+    <div class="row2">
+      <div><label>Wheel size</label>
+        <select name="wheel">
+          <option value="">any</option>
+          <option value="29_inch" {selo(ed_wheel,'29_inch')}>29"</option>
+          <option value="27_5_inch" {selo(ed_wheel,'27_5_inch')}>27.5"</option>
+          <option value="26_inch" {selo(ed_wheel,'26_inch')}>26"</option>
+          <option value="28_inch" {selo(ed_wheel,'28_inch')}>28"</option>
+          <option value="20_inch" {selo(ed_wheel,'20_inch')}>20"</option>
+          <option value="16_inch" {selo(ed_wheel,'16_inch')}>16"</option>
+        </select></div>
+      <div><label>Brand</label>
+        <select name="brand">
+          <option value="">any</option>
+          <option value="cube" {selo(ed_brand,'cube')}>Cube</option>
+          <option value="specialized" {selo(ed_brand,'specialized')}>Specialized</option>
+          <option value="scott" {selo(ed_brand,'scott')}>Scott</option>
+          <option value="focus" {selo(ed_brand,'focus')}>Focus</option>
+          <option value="rockrider" {selo(ed_brand,'rockrider')}>Rockrider</option>
+          <option value="btwin" {selo(ed_brand,'btwin')}>B'Twin</option>
+          <option value="pegas" {selo(ed_brand,'pegas')}>Pegas</option>
+          <option value="alt_brand" {selo(ed_brand,'alt_brand')}>Other brand</option>
+        </select></div>
+    </div>
+    <div class="note" style="margin:6px 0 0">Bikes have no type filter — put
+      "mountain bike" in the free-text query above. Category 987 = bikes.
+      Pick a single wheel size (OLX ignores multiple).</div>
+  </details>
   <div style="margin-top:12px; display:flex; gap:10px;">
     <button class="btn btn-go" type="submit">
       {'Save changes' if editing else 'Add search'}</button>
@@ -1371,6 +1403,12 @@ def build_search(form: dict[str, str]) -> dict:
     gearbox = form.get("gearbox", "").strip()
     if gearbox:
         filters["gearbox"] = [gearbox]
+    wheel = form.get("wheel", "").strip()
+    if wheel:
+        filters["dimensiune_roata"] = [wheel]  # OLX bike wheel-size enum
+    brand = form.get("brand", "").strip()
+    if brand:
+        filters["brand"] = [brand]
     if filters:
         s["filters"] = filters
     # Numeric range filters (vehicles): year, mileage.

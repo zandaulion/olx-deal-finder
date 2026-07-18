@@ -179,7 +179,9 @@ _CSS = """
   .menu .grp-items a { padding-left:28px; background:#0f1115; }
   .card { display:flex; gap:12px; margin:10px 16px; padding:10px; position:relative;
           background:#161a20; border:1px solid #262c36; border-radius:12px;
-          -webkit-touch-callout:none; }
+          -webkit-touch-callout:none; touch-action:pan-y; }
+  .card.sw-fav { box-shadow:inset 7px 0 0 -2px #f0c040; }
+  .card.sw-seen { box-shadow:inset -7px 0 0 -2px #4f8bff; }
   .hide-btn { position:absolute; top:6px; right:8px; width:26px; height:26px;
           border-radius:50%; background:#20252e; color:#8a93a2; z-index:2;
           display:flex; align-items:center; justify-content:center; font-size:14px;
@@ -388,25 +390,87 @@ function runAnalyze(e, btn) {{
     delete btn.dataset.busy; btn.textContent = '\\u2726 analyze';
   }});
 }}
-// Per-card gestures: title/image link to OLX; clicking elsewhere opens the
-// AI summary; long-press hides the card.
+// Set a per-listing flag on the server and reflect it in the card UI.
+function setFlag(card, path, on) {{
+  fetch(path, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'id=' + encodeURIComponent(card.dataset.id) + '&on=' + (on ? '1' : '0')
+  }});
+}}
+function swipeSeen(card) {{  // swipe left -> toggle "seen"
+  var btn = card.querySelector('.seen-toggle');
+  var on = !(btn && btn.classList.contains('on'));
+  setFlag(card, '/seen', on);
+  card.classList.toggle('seen', on);
+  if (btn) {{ btn.classList.toggle('on', on);
+    btn.textContent = on ? 'seen \\u2713' : 'mark seen'; }}
+}}
+function swipeFav(card) {{  // swipe right -> toggle favorite
+  var btn = card.querySelector('.fav-btn');
+  var on = !(btn && btn.classList.contains('on'));
+  setFlag(card, '/favorite', on);
+  if (btn) {{ btn.classList.toggle('on', on);
+    btn.textContent = on ? '\\u2605' : '\\u2606'; }}
+}}
+
+// Per-card gestures: title/image link to OLX; tap the body opens the AI
+// summary; long-press hides; horizontal swipe = seen (left) / favorite (right).
 document.querySelectorAll('.card[data-id]').forEach(function(card) {{
   var timer = null, fired = false;
-  card.addEventListener('touchstart', function() {{
-    fired = false;
+  var startX = 0, startY = 0, dx = 0, swiping = false, swiped = false;
+
+  function settle() {{
+    card.style.transition = 'transform .18s ease';
+    card.style.transform = '';
+    card.classList.remove('sw-fav', 'sw-seen');
+  }}
+
+  card.addEventListener('touchstart', function(e) {{
+    if (e.touches.length !== 1) return;
+    startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+    dx = 0; swiping = false; swiped = false; fired = false;
+    card.style.transition = '';
     timer = setTimeout(function() {{ fired = true; askHide(card); }}, 550);
   }}, {{passive: true}});
-  ['touchend', 'touchmove', 'touchcancel'].forEach(function(ev) {{
-    card.addEventListener(ev, function() {{ clearTimeout(timer); }});
+
+  card.addEventListener('touchmove', function(e) {{
+    var mx = e.touches[0].clientX - startX, my = e.touches[0].clientY - startY;
+    if (!swiping) {{
+      if (Math.abs(mx) > 12 && Math.abs(mx) > Math.abs(my) * 1.5) {{
+        swiping = true; clearTimeout(timer);   // horizontal -> swipe
+      }} else {{
+        if (Math.abs(my) > 10) clearTimeout(timer);  // vertical -> let it scroll
+        return;
+      }}
+    }}
+    dx = mx;
+    e.preventDefault();                          // hold the horizontal drag
+    card.style.transform = 'translateX(' + dx + 'px)';
+    card.classList.toggle('sw-fav', dx > 45);
+    card.classList.toggle('sw-seen', dx < -45);
+  }}, {{passive: false}});
+
+  ['touchend', 'touchcancel'].forEach(function(ev) {{
+    card.addEventListener(ev, function() {{
+      clearTimeout(timer);
+      if (!swiping) return;
+      if (dx <= -80) swipeSeen(card);
+      else if (dx >= 80) swipeFav(card);
+      settle();
+      swiped = true; swiping = false;           // suppress the trailing click
+    }});
   }});
+
   card.addEventListener('contextmenu', function(e) {{ e.preventDefault(); }});
   card.addEventListener('click', function(e) {{
-    if (fired) {{ e.preventDefault(); e.stopPropagation(); fired = false; return; }}
-    // OLX links and the interactive controls handle their own clicks.
+    if (fired || swiped) {{
+      e.preventDefault(); e.stopPropagation(); fired = false; swiped = false; return;
+    }}
     if (e.target.closest('.olx, .fav-btn, .hide-btn, .seen-btn, .ai-badge, .ai-panel'))
       return;
     var panel = card.querySelector('.ai-panel');
-    if (panel) panel.hidden = !panel.hidden;  // click body -> toggle AI summary
+    if (panel) panel.hidden = !panel.hidden;    // tap body -> toggle AI summary
   }});
 }});
 
@@ -675,7 +739,7 @@ def _card(sl, history: list | None = None, search_label: str | None = None,
     <div class="meta">{city}</div>
     {trend}
     {ai_panel}
-    <span class="seen-btn {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
+    <span class="seen-btn seen-toggle {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
     {ai_action}
   </div>
 </div>"""

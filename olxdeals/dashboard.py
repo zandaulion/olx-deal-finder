@@ -48,7 +48,7 @@ MANIFEST = {
 
 # Network-first so live data stays fresh; falls back to cache (offline shell).
 SW_JS = """
-const CACHE = 'olx-deals-v2';
+const CACHE = 'olx-deals-v3';
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/manifest.webmanifest'])));
   self.skipWaiting();
@@ -102,6 +102,8 @@ _CSS = """
   body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
          background:#0f1115; color:#e6e6e6;
          padding-bottom:calc(60px + env(safe-area-inset-bottom)); }
+  /* Centered, width-capped column so it doesn't stretch on desktop. */
+  .wrap { max-width:1200px; margin:0 auto; width:100%; }
   header { padding:10px 16px; background:#161a20; position:sticky; top:0;
            border-bottom:1px solid #262c36; z-index:5;
            padding-top:calc(10px + env(safe-area-inset-top)); }
@@ -119,12 +121,23 @@ _CSS = """
         border:1px solid #2c333f; cursor:pointer; }
   .btn-go { background:#1e5f3c; color:#c9f5d9; border-color:#1e5f3c; }
   .btn-del { background:#4a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
-  .tabbar { position:fixed; left:0; right:0; bottom:0; z-index:10; display:flex;
+  .tabbar { position:fixed; left:0; right:0; bottom:0; z-index:10;
         background:#161a20; border-top:1px solid #262c36;
         padding-bottom:env(safe-area-inset-bottom); }
+  .tabbar .wrap { display:flex; }
   .tabbar a { flex:1; display:flex; flex-direction:column; align-items:center;
         gap:2px; padding:7px 2px 8px; color:#8a93a2; text-decoration:none;
         font-size:10px; }
+  /* Card list: single column on mobile, responsive grid on wider screens. */
+  @media (min-width:760px) {
+    .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+             gap:12px; padding:4px 16px; }
+    .cards .card { margin:0; }
+    .card .thumb { width:96px; height:96px; }
+    /* Single-column UI shouldn't stretch across the full grid width. */
+    .chart { max-width:620px; }
+    .mng, .srow { max-width:660px; }
+  }
   .tabbar a .ic { font-size:19px; line-height:1.1; }
   .tabbar a.active { color:#4f8bff; }
   .filterbox { margin:8px 16px 0; }
@@ -155,6 +168,15 @@ _CSS = """
   .menu .items a.on .stat { color:#cdd9ff; }
   .menu .sstat { color:#8a93a2; font-size:12px; margin-left:6px; }
   .menu .dl { color:#5fd08a; }
+  .menu .grp { border-bottom:1px solid #20252e; }
+  .menu .grp > summary { list-style:none; cursor:pointer; display:flex;
+        align-items:center; gap:10px; padding:11px 12px; font-size:14px; }
+  .menu .grp > summary::-webkit-details-marker { display:none; }
+  .menu .grp-name { color:#e6e6e6; text-decoration:none; font-weight:600; flex:1; }
+  .menu .grp-name.on { color:#4f8bff; }
+  .menu .grp-caret { color:#8a93a2; font-size:11px; transition:transform .15s; }
+  .menu .grp[open] > summary .grp-caret { transform:rotate(90deg); }
+  .menu .grp-items a { padding-left:28px; background:#0f1115; }
   .card { display:flex; gap:12px; margin:10px 16px; padding:10px; position:relative;
           background:#161a20; border:1px solid #262c36; border-radius:12px;
           -webkit-touch-callout:none; }
@@ -240,27 +262,31 @@ _SHELL = """<!doctype html>
 <link rel="icon" type="image/png" href="/static/icon-192.png">
 <style>{css}</style></head><body>
 <header>
-  <div class="topbar">
-    <h1>OLX Deals</h1>
-    <div class="actions">
-      <form method="post" action="/sync">
-        <button class="iconbtn" type="submit" title="Sync now">&#8635;</button>
-      </form>
-      <button class="iconbtn" type="button" onclick="enableNotifs()"
-              title="Enable deal alerts">&#128276;</button>
+  <div class="wrap">
+    <div class="topbar">
+      <h1>OLX Deals</h1>
+      <div class="actions">
+        <form method="post" action="/sync">
+          <button class="iconbtn" type="submit" title="Sync now">&#8635;</button>
+        </form>
+        <button class="iconbtn" type="button" onclick="enableNotifs()"
+                title="Enable deal alerts">&#128276;</button>
+      </div>
     </div>
+    <div class="sub">{sub}</div>
   </div>
-  <div class="sub">{sub}</div>
 </header>
 {flash}
+<main class="wrap">
 {content}
-<nav class="tabbar">
+</main>
+<nav class="tabbar"><div class="wrap">
   <a href="{deals_href}" class="{deals_active}"><span class="ic">&#127991;</span>Deals</a>
   <a href="{drops_href}" class="{drops_active}"><span class="ic">&#128201;</span>Drops</a>
   <a href="/saved" class="{saved_active}"><span class="ic">&#9733;</span>Saved</a>
   <a href="{trends_href}" class="{trends_active}"><span class="ic">&#128202;</span>Trends</a>
   <a href="/searches" class="{manage_active}"><span class="ic">&#9881;</span>Manage</a>
-</nav>
+</div></nav>
 <script>
 // On Android, rewrite listing links to open the OLX app (ro.mercador),
 // falling back to the web page if the app isn't installed.
@@ -279,8 +305,15 @@ function excludeId(id, el) {{
   fetch('/exclude', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-    body: 'id=' + encodeURIComponent(id)
-  }}).then(function(r) {{ if (r.ok && el) el.remove(); }});
+    body: 'id=' + encodeURIComponent(id),
+    cache: 'no-store'
+  }}).then(function(r) {{
+    if (r.ok) {{ if (el) el.remove(); }}
+    else {{ alert('Could not hide (server returned ' + r.status + ').'); }}
+  }}).catch(function(err) {{
+    alert('Could not hide — request failed: ' + err +
+          '\\nIf this keeps happening, close and reopen the app to refresh it.');
+  }});
 }}
 function askHide(card) {{
   if (!card) return;
@@ -377,9 +410,9 @@ async function enableNotifs() {{
 # tabs restore where you left off. Single-user local app -> a module dict is fine.
 _LAST_QUERY: dict[str, str] = {}
 _REMEMBER_KEYS = {
-    "/": ["search", "sort", "seller", "pmin", "pmax", "hide_seen"],
-    "/drops": ["search"],
-    "/history": ["search"],
+    "/": ["search", "group", "sort", "seller", "pmin", "pmax", "hide_seen"],
+    "/drops": ["search", "group"],
+    "/history": ["search", "group"],
 }
 
 
@@ -582,42 +615,108 @@ def _search_keys(config_path: str, db_path: str) -> list[str]:
     return keys
 
 
-def _menu(keys: list[str], base: str, selected: str | None,
-          stats: dict[str, str] | None = None, totals: str = "") -> str:
-    """Hamburger dropdown: current selection + a list of all searches, each
-    with its stat (active count · deal count) on the right when provided."""
-    if not keys:
-        return ""
-    current = selected if selected in keys else None
-    stats = stats or {}
+def _search_groups(config_path: str, db_path: str):
+    """Ordered {group: [keys]} from config (group field, default 'Other'),
+    plus a {key: group} map. DB-only keys land in 'Other'."""
+    searches = config.load_raw(config_path).get("searches", [])
+    groups: dict[str, list[str]] = {}
+    key_group: dict[str, str] = {}
+    for s in searches:
+        k = s.get("key")
+        if not k:
+            continue
+        g = (s.get("group") or "").strip() or "Other"
+        groups.setdefault(g, [])
+        if k not in groups[g]:
+            groups[g].append(k)
+        key_group[k] = g
+    for k in _search_keys(config_path, db_path):  # orphan DB-only keys
+        if k not in key_group:
+            groups.setdefault("Other", [])
+            if k not in groups["Other"]:
+                groups["Other"].append(k)
+            key_group[k] = "Other"
+    return groups, key_group
 
-    def item(href: str, name: str, on: bool, stat: str) -> str:
-        right = f'<span class="stat">{stat}</span>' if stat else ""
-        return (f'<a href="{href}" class="{"on" if on else ""}">'
-                f'<span>{name}</span>{right}</a>')
 
-    items = [item(base, "All searches", not current, totals)]
+def _menu_counts(store: Store, keys: list[str]) -> dict[str, tuple[int, int]]:
+    """{key: (active_count, deal_count)} for the dropdown stats."""
+    out: dict[str, tuple[int, int]] = {}
     for k in keys:
-        items.append(item(f"{base}?search={urllib.parse.quote(k)}",
-                          html.escape(k), k == current, stats.get(k, "")))
+        active = store.active_for_search(k)
+        out[k] = (len(active), len(score_search(k, active).deals))
+    return out
 
-    label = html.escape(current) if current else "All searches"
-    summary_stat = stats.get(current, "") if current else totals
-    sfx = f'<span class="sstat">· {summary_stat}</span>' if summary_stat else ""
+
+def _stat_html(active: int, deals: int) -> str:
+    return f'<span class="stat">{active} · <span class="dl">{deals}&#9670;</span></span>'
+
+
+def _resolve_scope(config_path: str, db_path: str,
+                   selected: str | None, group: str | None):
+    """Resolve which searches to show from ?search / ?group.
+    Returns (all_keys, groups, show, scope, selected, group)."""
+    all_keys = _search_keys(config_path, db_path)
+    groups, _kg = _search_groups(config_path, db_path)
+    if selected in all_keys:
+        return all_keys, groups, [selected], "search", selected, None
+    if group in groups:
+        return all_keys, groups, groups[group], "group", None, group
+    return all_keys, groups, all_keys, "all", None, None
+
+
+def _grouped_menu(groups: dict, base: str, sel_search: str | None,
+                  sel_group: str | None, counts: dict, totals: tuple) -> str:
+    """Accordion dropdown: All → groups (expandable) → searches."""
+    def link(href, label, on, stat):
+        return (f'<a href="{href}" class="{"on" if on else ""}">'
+                f'<span>{label}</span>{stat}</a>')
+
+    all_on = not sel_search and not sel_group
+    rows = [link(base, "All searches", all_on, _stat_html(*totals))]
+    for gname, keys in groups.items():
+        ga = sum(counts.get(k, (0, 0))[0] for k in keys)
+        gd = sum(counts.get(k, (0, 0))[1] for k in keys)
+        expanded = sel_group == gname or sel_search in keys
+        gsel = sel_group == gname
+        inner = "".join(
+            link(f"{base}?search={urllib.parse.quote(k)}", html.escape(k),
+                 sel_search == k, _stat_html(*counts.get(k, (0, 0))))
+            for k in keys)
+        rows.append(
+            f'<details class="grp" {"open" if expanded else ""}><summary>'
+            f'<a class="grp-name {"on" if gsel else ""}" '
+            f'href="{base}?group={urllib.parse.quote(gname)}">{html.escape(gname)}</a>'
+            f'{_stat_html(ga, gd)}<span class="grp-caret">&#9656;</span></summary>'
+            f'<div class="grp-items">{inner}</div></details>')
+
+    if sel_search:
+        label, stat = html.escape(sel_search), _stat_html(*counts.get(sel_search, (0, 0)))
+    elif sel_group:
+        keys = groups.get(sel_group, [])
+        label = html.escape(sel_group)
+        stat = _stat_html(sum(counts.get(k, (0, 0))[0] for k in keys),
+                          sum(counts.get(k, (0, 0))[1] for k in keys))
+    else:
+        label, stat = "All searches", _stat_html(*totals)
     return (f'<details class="menu"><summary>'
-            f'<span class="burger">&#9776;</span>{label}{sfx}'
+            f'<span class="burger">&#9776;</span>{label}'
+            f'<span class="sstat">· {stat}</span>'
             f'<span class="caret">&#9662;</span></summary>'
-            f'<div class="items">{"".join(items)}</div></details>')
+            f'<div class="items">{"".join(rows)}</div></details>')
 
 
-def _controls_bar(selected: str | None, f: dict) -> str:
+def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
     """Sort/filter controls, collapsed behind a 'Filters' toggle.
     Opens by default only when a non-default filter is active."""
     def opt(name, value, label):
         sel = "selected" if f.get(name) == value else ""
         return f'<option value="{value}" {sel}>{label}</option>'
-    hidden = (f'<input type="hidden" name="search" value="{html.escape(selected)}">'
-              if selected else "")
+    hidden = ""
+    if selected:
+        hidden = f'<input type="hidden" name="search" value="{html.escape(selected)}">'
+    elif group:
+        hidden = f'<input type="hidden" name="group" value="{html.escape(group)}">'
     checked = "checked" if f.get("hide_seen") else ""
     active = (f.get("sort", "deal") != "deal" or f.get("seller", "all") != "all"
               or f.get("pmin") or f.get("pmax") or f.get("hide_seen"))
@@ -642,7 +741,8 @@ def _controls_bar(selected: str | None, f: dict) -> str:
 
 
 def render_deals(db_path: str, config_path: str, selected: str | None = None,
-                 flash: str = "", filters: dict | None = None) -> str:
+                 group: str | None = None, flash: str = "",
+                 filters: dict | None = None) -> str:
     f = filters or {}
     seller = f.get("seller", "all")
     pmin, pmax = f.get("pmin"), f.get("pmax")
@@ -650,11 +750,17 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
     sort = f.get("sort", "deal")
 
     all_keys = _search_keys(config_path, db_path)
-    show = [selected] if selected in all_keys else all_keys
-    viewing_all = selected not in all_keys
+    groups, _kg = _search_groups(config_path, db_path)
+    if selected in all_keys:
+        show, scope, group = [selected], "search", None
+    elif group in groups:
+        show, scope, selected = groups[group], "group", None
+    else:
+        show, scope, selected, group = all_keys, "all", None, None
+    show_label = scope != "search"
     store = Store(db_path)
     try:
-        menu_stats: dict[str, str] = {}
+        counts: dict[str, tuple[int, int]] = {}
         total_deals = total_active = shown_deals = 0
         sel_header = ""
         # (search_key, ScoredListing, history) across every shown search.
@@ -665,17 +771,16 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             active = store.active_for_search(key)
             sd = score_search(key, active)
             ndeals = len(sd.deals)
+            counts[key] = (len(active), ndeals)
             total_deals += ndeals
             total_active += len(active)
-            menu_stats[key] = (f'{len(active)} · '
-                               f'<span class="dl">{ndeals}&#9670;</span>')
             if key not in show:
                 continue
             shown_deals += ndeals
             hist = store.histories([l.raw["id"] for l in sd.listings])
             for l in sd.listings:
                 pool.append((key, l, hist.get(l.raw["id"])))
-            if not viewing_all:  # single search: one compact header line
+            if scope == "search":  # single search: one compact header line
                 med = f"{sd.median:.0f} RON" if sd.median else "—"
                 susp = len(sd.suspicious)
                 susp_txt = f" · {susp} too-cheap" if susp else ""
@@ -687,8 +792,6 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                 else:
                     sel_header = ('<div class="note" style="margin:8px 16px 0">'
                                   'No active listings — try Sync now.</div>')
-        totals_str = (f'{total_active} · '
-                      f'<span class="dl">{total_deals}&#9670;</span>')
 
         # --- filters ---
         def keep(sl) -> bool:
@@ -723,15 +826,24 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         pool = pool[:DISPLAY_CAP]  # bound page weight after sort/filter
 
         cards = "".join(
-            _card(l, h, search_label=key if viewing_all else None)
+            _card(l, h, search_label=key if show_label else None)
             for key, l, h in pool)
-        body = sel_header + cards or \
-            '<div class="empty">No searches yet. Add one on Manage, then Sync now.</div>'
-        content = (_sync_banner(store)
-                   + _menu(all_keys, "/", selected, menu_stats, totals_str)
-                   + _controls_bar(selected, f) + body)
-        scope = f"'{selected}'" if not viewing_all else f"{len(all_keys)} search(es)"
-        sub = (f"{scope} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
+        if cards:
+            body = sel_header + f'<div class="cards">{cards}</div>'
+        else:
+            body = ('<div class="empty">No searches yet. '
+                    'Add one on Manage, then Sync now.</div>')
+        menu = _grouped_menu(groups, "/", selected, group, counts,
+                             (total_active, total_deals))
+        content = (_sync_banner(store) + menu
+                   + _controls_bar(selected, group, f) + body)
+        if scope == "search":
+            scope_txt = f"'{selected}'"
+        elif scope == "group":
+            scope_txt = f"group '{group}'"
+        else:
+            scope_txt = f"{len(all_keys)} search(es)"
+        sub = (f"{scope_txt} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
                f"EUR→RON {EUR_TO_RON}")
     finally:
         store.close()
@@ -757,8 +869,9 @@ def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
                     cards_data.append((l.deal_score, key, l, hist.get(l.raw["id"])))
         cards_data.sort(key=lambda t: t[0], reverse=True)
         if cards_data:
-            body = "".join(_card(l, h, search_label=key)
-                           for _, key, l, h in cards_data)
+            body = (f'<div class="cards">'
+                    + "".join(_card(l, h, search_label=key)
+                              for _, key, l, h in cards_data) + '</div>')
         else:
             body = ('<div class="empty">No saved listings yet.<br>'
                     'Tap the ☆ on any card to save it here.</div>')
@@ -770,17 +883,21 @@ def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
 
 
 def render_drops(db_path: str, config_path: str, selected: str | None = None,
-                 flash: str = "") -> str:
+                 group: str | None = None, flash: str = "") -> str:
     """Listings whose price has fallen since we first saw them, biggest first.
     Drops that land in deal range are highlighted."""
-    all_keys = _search_keys(config_path, db_path)
-    show = [selected] if selected in all_keys else all_keys
+    all_keys, groups, show, scope, selected, group = _resolve_scope(
+        config_path, db_path, selected, group)
     store = Store(db_path)
     try:
+        counts: dict[str, tuple[int, int]] = {}
         cards: list[tuple[float, str]] = []
-        for key in show:
+        for key in all_keys:
             active = store.active_for_search(key)
             sd = score_search(key, active)
+            counts[key] = (len(active), len(sd.deals))
+            if key not in show:
+                continue
             hist = store.histories([l.raw["id"] for l in sd.listings])
             for l in sd.listings:
                 series = _ron_series(hist.get(l.raw["id"]))
@@ -789,14 +906,18 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
                     cards.append((pct, _card(l, hist.get(l.raw["id"]))))
         cards.sort(key=lambda c: c[0], reverse=True)
         if cards:
-            body = "".join(c for _, c in cards)
+            body = f'<div class="cards">{"".join(c for _, c in cards)}</div>'
         else:
             body = ('<div class="empty">No price drops recorded yet.<br>'
                     'Drops appear here once a tracked listing gets cheaper '
                     'between syncs — check back after a day or two.</div>')
-        content = _sync_banner(store) + _menu(all_keys, "/drops", selected) + body
-        scope = f"'{selected}'" if selected else "all searches"
-        sub = f"{len(cards)} price drop(s) · {scope}"
+        totals = (sum(a for a, _ in counts.values()),
+                  sum(d for _, d in counts.values()))
+        menu = _grouped_menu(groups, "/drops", selected, group, counts, totals)
+        content = _sync_banner(store) + menu + body
+        scope_txt = (f"'{selected}'" if scope == "search" else
+                     f"group '{group}'" if scope == "group" else "all searches")
+        sub = f"{len(cards)} price drop(s) · {scope_txt}"
     finally:
         store.close()
     return _shell(sub, content, "drops", flash)
@@ -868,11 +989,12 @@ def _candlestick(candles: list[dict], w: int = 340, h: int = 210) -> str:
 
 
 def render_history(db_path: str, config_path: str, selected: str | None = None,
-                   flash: str = "") -> str:
-    all_keys = _search_keys(config_path, db_path)
-    show = [selected] if selected in all_keys else all_keys
+                   group: str | None = None, flash: str = "") -> str:
+    all_keys, groups, show, scope, selected, group = _resolve_scope(
+        config_path, db_path, selected, group)
     store = Store(db_path)
     try:
+        counts = _menu_counts(store, all_keys)
         blocks = [
             '<div class="note" style="margin:8px 16px 0">Daily candles · '
             'wick = min–max · box = Q1–Q3 · line = median · '
@@ -890,7 +1012,10 @@ def render_history(db_path: str, config_path: str, selected: str | None = None,
                     f'max {last["high"]:.0f} RON · {last["n"]} listings</div>')
             blocks.append(f'<div class="chart">{_candlestick(candles)}</div>')
         body = "".join(blocks)
-        content = _sync_banner(store) + _menu(all_keys, "/history", selected) + body
+        totals = (sum(a for a, _ in counts.values()),
+                  sum(d for _, d in counts.values()))
+        menu = _grouped_menu(groups, "/history", selected, group, counts, totals)
+        content = _sync_banner(store) + menu + body
         sub = "daily min / median / max per search"
     finally:
         store.close()
@@ -921,6 +1046,10 @@ def render_searches(config_path: str, db_path: str, edit_key: str | None = None,
     data = config.load_raw(config_path)
     searches = data.get("searches", [])
     editing = next((s for s in searches if s.get("key") == edit_key), None) if edit_key else None
+    existing_groups = sorted({(s.get("group") or "").strip()
+                              for s in searches if (s.get("group") or "").strip()})
+    ed_group = html.escape(editing.get("group") or "") if editing else ""
+    datalist = "".join(f'<option value="{html.escape(g)}">' for g in existing_groups)
 
     def val(key, default=""):
         if not editing:
@@ -993,6 +1122,9 @@ function setModel(k){
   <label>Key (unique id)</label>
   <input name="key" value="{val('key')}" placeholder="iphone_15_used" required
          {'readonly' if editing else ''}>
+  <label>Group (optional)</label>
+  <input name="group" value="{ed_group}" list="groups" placeholder="Fold, Phones, Cars…">
+  <datalist id="groups">{datalist}</datalist>
   <label>OLX model key (optional)</label>
   <input name="model" value="{ed_model}" placeholder="iphone_15">
   <div class="row2">
@@ -1055,10 +1187,9 @@ function setModel(k){
     so a fixed category can hide results. Use the finder above to get the model key.</div>
 </form>"""
 
-    rows = []
-    for s in searches:
+    def srow(s: dict) -> str:
         key = html.escape(s.get("key", ""))
-        rows.append(f"""<div class="srow">
+        return f"""<div class="srow">
   <div class="info"><div class="k">{key}</div>
     <div class="d">{html.escape(_search_summary(s))}</div></div>
   <a class="btn" href="/searches?edit={urllib.parse.quote(s.get('key',''))}">Edit</a>
@@ -1067,8 +1198,18 @@ function setModel(k){
     <input type="hidden" name="key" value="{key}">
     <button class="btn btn-del" type="submit">Delete</button>
   </form>
-</div>""")
-    listing = "".join(rows) or '<div class="empty">No searches yet.</div>'
+</div>"""
+
+    # Group the search list under group headers (config order of first appearance).
+    grouped: dict[str, list[dict]] = {}
+    for s in searches:
+        grouped.setdefault((s.get("group") or "").strip() or "Other", []).append(s)
+    listing = ""
+    for gname, gsearches in grouped.items():
+        listing += (f'<div class="search"><b>{html.escape(gname)}</b> · '
+                    f'{len(gsearches)} search(es)</div>')
+        listing += "".join(srow(s) for s in gsearches)
+    listing = listing or '<div class="empty">No searches yet.</div>'
     content = form + '<div class="search"><b>Current searches</b></div>' + listing
 
     # Hidden listings — excluded via ✕ / long-press, restorable here.
@@ -1123,6 +1264,9 @@ def build_search(form: dict[str, str]) -> dict:
     # on its own (OLX phone categories are per-brand: 948=Apple, 956=Samsung…).
     cat = _int_or_none(form.get("category_id"))
     s: dict = {"key": key, "category_id": cat if cat is not None else 0}
+    group = form.get("group", "").strip()
+    if group:
+        s["group"] = group
     filters: dict = {}
     model = form.get("model", "").strip()
     if model:
@@ -1242,7 +1386,8 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
         flash = qs.get("msg", [""])[0]
         selected = qs.get("search", [None])[0]
-        # Remember selected search + filters per view so the tabs restore them.
+        group = qs.get("group", [None])[0]
+        # Remember selected search/group + filters per view so tabs restore them.
         _remember("/" if parsed.path == "/index.html" else parsed.path, qs)
         if parsed.path in ("/", "/index.html"):
             filters = {
@@ -1253,14 +1398,15 @@ class Handler(BaseHTTPRequestHandler):
                 "hide_seen": qs.get("hide_seen", [None])[0] == "1",
             }
             self._html(render_deals(
-                self.db_path, self.config_path, selected, flash, filters))
+                self.db_path, self.config_path, selected, group, flash, filters))
         elif parsed.path == "/saved":
             self._html(render_saved(self.db_path, self.config_path, flash))
         elif parsed.path == "/drops":
-            self._html(render_drops(self.db_path, self.config_path, selected, flash))
+            self._html(render_drops(
+                self.db_path, self.config_path, selected, group, flash))
         elif parsed.path == "/history":
             self._html(render_history(
-                self.db_path, self.config_path, selected, flash))
+                self.db_path, self.config_path, selected, group, flash))
         elif parsed.path == "/searches":
             edit_key = qs.get("edit", [None])[0]
             self._html(render_searches(

@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS listings (
     region            TEXT,
     is_business       INTEGER,
     photo             TEXT,
+    photos            TEXT,
+    description       TEXT,
+    seller_id         INTEGER,
+    seller_name       TEXT,
+    seller_since      TEXT,
     created_time      TEXT,
     last_refresh_time TEXT,
     first_seen        TEXT NOT NULL,
@@ -86,12 +91,23 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     auth     TEXT NOT NULL,
     created  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS llm_analysis (
+    listing_id   INTEGER PRIMARY KEY,
+    ts           TEXT NOT NULL,
+    model        TEXT,
+    score        INTEGER,
+    scam_risk    TEXT,
+    summary      TEXT,
+    verdict_json TEXT
+);
 """
 
 _FIELDS = [
     "id", "search_key", "url", "title", "price", "currency", "negotiable",
     "previous_price", "model", "state", "city", "region", "is_business",
-    "photo", "created_time", "last_refresh_time",
+    "photo", "photos", "description", "seller_id", "seller_name",
+    "seller_since", "created_time", "last_refresh_time",
 ]
 
 
@@ -136,6 +152,12 @@ class Store:
                 self.conn.execute(
                     f"ALTER TABLE listings ADD COLUMN {col} "
                     "INTEGER NOT NULL DEFAULT 0")
+        for col, typ in (("photos", "TEXT"), ("description", "TEXT"),
+                         ("seller_id", "INTEGER"), ("seller_name", "TEXT"),
+                         ("seller_since", "TEXT")):
+            if col not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE listings ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         self.conn.close()
@@ -278,6 +300,30 @@ class Store:
                 "q1": r["q1"], "median": r["median"], "q3": r["q3"], "n": r["n"],
             }
         return list(by_day.values())
+
+    def save_analysis(self, listing_id: int, model: str,
+                      verdict: dict[str, Any]) -> None:
+        import json as _json
+        self.conn.execute(
+            "INSERT OR REPLACE INTO llm_analysis "
+            "(listing_id, ts, model, score, scam_risk, summary, verdict_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (listing_id, _now(), model, verdict.get("verdict_score"),
+             verdict.get("scam_risk"), verdict.get("summary"),
+             _json.dumps(verdict, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+    def get_analyses(self, ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Batch-fetch stored verdicts: {listing_id: row-with-verdict_json}."""
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM llm_analysis WHERE listing_id IN ({marks})",
+            tuple(ids),
+        ).fetchall()
+        return {r["listing_id"]: dict(r) for r in rows}
 
     def add_subscription(self, sub: dict[str, Any]) -> None:
         keys = sub.get("keys") or {}

@@ -195,6 +195,15 @@ _CSS = """
           border:1px solid #2c333f; border-radius:6px; padding:2px 9px; }
   .seen-btn.on { color:#8fd0a0; border-color:#2f5f3c; }
   .b-new { background:#123a3a; color:#a6eaea; }
+  .ai-badge { cursor:pointer; }
+  .ai-good { background:#1e5f3c; color:#c9f5d9; }
+  .ai-mid { background:#5a4a1e; color:#f0dca0; }
+  .ai-bad { background:#5a1e1e; color:#f0b6b6; }
+  .ai-panel { margin-top:6px; padding:8px 10px; background:#0f1115;
+          border:1px solid #2c333f; border-radius:8px; font-size:12px;
+          color:#cbd3df; line-height:1.5; }
+  .ai-panel ul { margin:4px 0; padding-left:18px; color:#f0b6a0; }
+  .ai-panel .ai-meta { color:#8a93a2; margin-top:4px; }
   .controls { margin:6px 0 2px; display:flex; flex-wrap:wrap; gap:8px;
           align-items:center; font-size:13px; color:#8a93a2; }
   .controls select, .controls input { background:#0f1115; color:#e6e6e6;
@@ -203,8 +212,10 @@ _CSS = """
   .controls .apply { background:#2f5fd0; color:#fff; border-color:#2f5fd0;
           cursor:pointer; }
   .card.deal { border-color:#2f7d4f; background:#132018; }
-  a.card { text-decoration:none; color:inherit; }
-  a.card:active { background:#1c2230; }
+  .olx { color:inherit; text-decoration:none; }
+  .imglink { flex:none; display:block; line-height:0; }
+  .card.has-ai { cursor:pointer; }
+  .card.has-ai:active { background:#1c2230; }
   .thumb { width:84px; height:84px; border-radius:8px; object-fit:cover;
            background:#20252e; flex:none; }
   .body { min-width:0; flex:1; }
@@ -291,7 +302,7 @@ _SHELL = """<!doctype html>
 // On Android, rewrite listing links to open the OLX app (ro.mercador),
 // falling back to the web page if the app isn't installed.
 if (/Android/i.test(navigator.userAgent)) {{
-  document.querySelectorAll('a.card[data-olx]').forEach(function(a) {{
+  document.querySelectorAll('a.olx[data-olx]').forEach(function(a) {{
     var u = a.dataset.olx;
     a.href = 'intent://' + u.replace(/^https?:\\/\\//, '') +
       '#Intent;scheme=https;package=ro.mercador;S.browser_fallback_url=' +
@@ -323,12 +334,12 @@ function askHide(card) {{
 }}
 function hideCard(e, btn) {{
   e.preventDefault(); e.stopPropagation();
-  askHide(btn.closest('a.card'));
+  askHide(btn.closest('.card'));
 }}
 // Toggle a per-listing flag (favorite / seen) without navigating.
 function toggleFlag(e, btn, path, cls, onOk) {{
   e.preventDefault(); e.stopPropagation();
-  var card = btn.closest('a.card'); if (!card) return;
+  var card = btn.closest('.card'); if (!card) return;
   var on = !btn.classList.contains('on');
   fetch(path, {{
     method: 'POST',
@@ -348,8 +359,38 @@ function toggleSeen(e, btn) {{
   toggleFlag(e, btn, '/seen', 'seen',
     function(on) {{ btn.textContent = on ? 'seen \\u2713' : 'mark seen'; }});
 }}
-// Long-press gesture as an alternative to the ✕ button.
-document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
+// LLM verdict: toggle the detail panel / run an on-demand analysis.
+function toggleAi(e, el) {{
+  e.preventDefault(); e.stopPropagation();
+  var p = el.closest('.card').querySelector('.ai-panel');
+  if (p) p.hidden = !p.hidden;
+}}
+function runAnalyze(e, btn) {{
+  e.preventDefault(); e.stopPropagation();
+  if (btn.dataset.busy) return;
+  btn.dataset.busy = '1';
+  btn.textContent = 'analyzing\\u2026';
+  var card = btn.closest('.card');
+  fetch('/analyze', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'id=' + encodeURIComponent(card.dataset.id)
+  }}).then(function(r) {{
+    if (r.ok) {{ location.reload(); }}
+    else {{
+      r.text().then(function(t) {{
+        alert('Analysis failed: ' + (t || r.status));
+        delete btn.dataset.busy; btn.textContent = '\\u2726 analyze';
+      }});
+    }}
+  }}).catch(function(err) {{
+    alert('Analysis failed: ' + err);
+    delete btn.dataset.busy; btn.textContent = '\\u2726 analyze';
+  }});
+}}
+// Per-card gestures: title/image link to OLX; clicking elsewhere opens the
+// AI summary; long-press hides the card.
+document.querySelectorAll('.card[data-id]').forEach(function(card) {{
   var timer = null, fired = false;
   card.addEventListener('touchstart', function() {{
     fired = false;
@@ -360,7 +401,12 @@ document.querySelectorAll('a.card[data-id]').forEach(function(card) {{
   }});
   card.addEventListener('contextmenu', function(e) {{ e.preventDefault(); }});
   card.addEventListener('click', function(e) {{
-    if (fired) {{ e.preventDefault(); fired = false; }}
+    if (fired) {{ e.preventDefault(); e.stopPropagation(); fired = false; return; }}
+    // OLX links and the interactive controls handle their own clicks.
+    if (e.target.closest('.olx, .fav-btn, .hide-btn, .seen-btn, .ai-badge, .ai-panel'))
+      return;
+    var panel = card.querySelector('.ai-panel');
+    if (panel) panel.hidden = !panel.hidden;  // click body -> toggle AI summary
   }});
 }});
 
@@ -527,7 +573,38 @@ def _sparkline(series: list[float], w: int = 130, h: int = 28) -> str:
             f'points="{" ".join(pts)}"/></svg>')
 
 
-def _card(sl, history: list | None = None, search_label: str | None = None) -> str:
+def _ai_bits(analysis: dict | None) -> tuple[str, str, str]:
+    """(badge_html, panel_html, action_html) for a listing's LLM verdict."""
+    if not analysis:
+        return "", "", ('<span class="seen-btn" '
+                        'onclick="runAnalyze(event,this)">✦ analyze</span>')
+    score = analysis.get("score") or 0
+    risk = analysis.get("scam_risk") or "?"
+    cls = "ai-good" if score >= 70 else "ai-mid" if score >= 40 else "ai-bad"
+    if risk == "high":
+        cls = "ai-bad"
+    try:
+        v = json.loads(analysis.get("verdict_json") or "{}")
+    except ValueError:
+        v = {}
+    flags = "".join(f"<li>{html.escape(f)}</li>"
+                    for f in v.get("red_flags") or [])
+    panel = f"""<div class="ai-panel" hidden
+     onclick="event.preventDefault();event.stopPropagation()">
+  <div><b>{html.escape(v.get('summary', ''))}</b></div>
+  <div>Condition: {html.escape(v.get('condition_summary', ''))}</div>
+  {'<ul>' + flags + '</ul>' if flags else ''}
+  <div>&#128161; {html.escape(v.get('negotiation_tip', ''))}</div>
+  <div class="ai-meta">scam risk: {html.escape(str(risk))} · photos match:
+    {'yes' if v.get('photos_match_description') else '<b>NO</b>'}</div>
+</div>"""
+    badge = (f'<span class="badge ai-badge {cls}" '
+             f'onclick="toggleAi(event,this)">AI {score}</span>')
+    return badge, panel, ""
+
+
+def _card(sl, history: list | None = None, search_label: str | None = None,
+          analysis: dict | None = None) -> str:
     r = sl.raw
     title = html.escape(r.get("title") or "—")
     url = html.escape(r.get("url") or "#")
@@ -580,23 +657,28 @@ def _card(sl, history: list | None = None, search_label: str | None = None) -> s
     seen_on = "on" if r.get("seen") else ""
     seen_txt = "seen ✓" if r.get("seen") else "mark seen"
     seen_cls = "seen" if r.get("seen") else ""
+    ai_badge, ai_panel, ai_action = _ai_bits(analysis)
+    has_ai = " has-ai" if analysis else ""
+    olx = f'href="{url}" target="_blank" rel="noopener" data-olx="{url}"'
 
-    return f"""<a class="card {'deal' if sl.is_deal else ''} {seen_cls}" href="{url}"
-   target="_blank" rel="noopener" data-olx="{url}" data-id="{r.get('id')}">
+    return f"""<div class="card {'deal' if sl.is_deal else ''} {seen_cls}{has_ai}"
+   data-olx="{url}" data-id="{r.get('id')}">
   <span class="fav-btn {fav_on}" title="Save to favorites"
         onclick="toggleFav(event, this)">{fav_glyph}</span>
   <span class="hide-btn" title="Hide from tracking"
         onclick="hideCard(event, this)">✕</span>
-  {img}
+  <a class="olx imglink" {olx}>{img}</a>
   <div class="body">
-    <p class="title">{title}</p>
+    <p class="title"><a class="olx" {olx}>{title}</a></p>
     <div class="price">{price_txt}{orig}</div>
-    <div>{badges}</div>
+    <div>{badges}{ai_badge}</div>
     <div class="meta">{city}</div>
     {trend}
+    {ai_panel}
     <span class="seen-btn {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
+    {ai_action}
   </div>
-</a>"""
+</div>"""
 
 
 def _search_keys(config_path: str, db_path: str) -> list[str]:
@@ -825,8 +907,10 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         pool.sort(key=lambda t: bool(t[1].raw.get("seen")))  # unseen first, stable
         pool = pool[:DISPLAY_CAP]  # bound page weight after sort/filter
 
+        analyses = store.get_analyses([l.raw["id"] for _, l, _ in pool])
         cards = "".join(
-            _card(l, h, search_label=key if show_label else None)
+            _card(l, h, search_label=key if show_label else None,
+                  analysis=analyses.get(l.raw["id"]))
             for key, l, h in pool)
         if cards:
             body = sel_header + f'<div class="cards">{cards}</div>'
@@ -869,8 +953,11 @@ def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
                     cards_data.append((l.deal_score, key, l, hist.get(l.raw["id"])))
         cards_data.sort(key=lambda t: t[0], reverse=True)
         if cards_data:
+            analyses = store.get_analyses(
+                [l.raw["id"] for _, _, l, _ in cards_data])
             body = (f'<div class="cards">'
-                    + "".join(_card(l, h, search_label=key)
+                    + "".join(_card(l, h, search_label=key,
+                                    analysis=analyses.get(l.raw["id"]))
                               for _, key, l, h in cards_data) + '</div>')
         else:
             body = ('<div class="empty">No saved listings yet.<br>'
@@ -903,10 +990,14 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
                 series = _ron_series(hist.get(l.raw["id"]))
                 if len(series) >= 2 and series[-1] < series[0]:
                     pct = (series[0] - series[-1]) / series[0]
-                    cards.append((pct, _card(l, hist.get(l.raw["id"]))))
+                    cards.append((pct, l, hist.get(l.raw["id"])))
         cards.sort(key=lambda c: c[0], reverse=True)
         if cards:
-            body = f'<div class="cards">{"".join(c for _, c in cards)}</div>'
+            analyses = store.get_analyses([l.raw["id"] for _, l, _ in cards])
+            body = ('<div class="cards">'
+                    + "".join(_card(l, h, analysis=analyses.get(l.raw["id"]))
+                              for _, l, h in cards)
+                    + '</div>')
         else:
             body = ('<div class="empty">No price drops recorded yet.<br>'
                     'Drops appear here once a tracked listing gets cheaper '
@@ -1507,6 +1598,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_test_push()
                 self.send_response(204)
                 self.end_headers()
+            elif parsed.path == "/analyze":
+                self._run_analysis(_int_or_none(self._form().get("id")))
             elif parsed.path == "/sync":
                 self._trigger_sync()
                 # Return to the Deals view with its remembered search + filters.
@@ -1525,6 +1618,35 @@ class Handler(BaseHTTPRequestHandler):
             store.conn.execute(
                 "UPDATE listings SET active=0 WHERE search_key=?", (key,))
             store.conn.commit()
+        finally:
+            store.close()
+
+    def _run_analysis(self, listing_id: int | None) -> None:
+        """On-demand LLM analysis for one listing (synchronous, ~20-60s)."""
+        import os
+        if listing_id is None:
+            self.send_error(400)
+            return
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"ANTHROPIC_API_KEY not configured")
+            return
+        store = Store(self.db_path)
+        try:
+            listing = store.get(listing_id)
+            if not listing:
+                self.send_error(404)
+                return
+            from .analyzer import analyze
+            analyze(store, listing)
+            self.send_response(204)
+            self.end_headers()
+        except Exception as exc:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(str(exc)[:300].encode("utf-8"))
         finally:
             store.close()
 

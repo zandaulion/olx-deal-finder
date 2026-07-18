@@ -7,6 +7,7 @@ raw offer into a flat ``Listing`` dict that the rest of the pipeline consumes.
 
 from __future__ import annotations
 
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -77,15 +78,15 @@ class SearchSpec:
         return params
 
 
-def _best_photo(offer: dict[str, Any]) -> str | None:
-    photos = offer.get("photos") or []
-    if not photos:
-        return None
-    link = photos[0].get("link")
-    if not link:
-        return None
-    # Photo links are templated, e.g. ".../image;s={width}x{height}".
-    return link.replace("{width}", "800").replace("{height}", "600")
+def _photo_urls(offer: dict[str, Any]) -> list[str]:
+    """All photo URLs, resolved from OLX's templated links."""
+    urls = []
+    for p in offer.get("photos") or []:
+        link = p.get("link")
+        if link:
+            # Photo links are templated, e.g. ".../image;s={width}x{height}".
+            urls.append(link.replace("{width}", "800").replace("{height}", "600"))
+    return urls
 
 
 def normalise(offer: dict[str, Any], search_key: str) -> dict[str, Any]:
@@ -97,6 +98,8 @@ def normalise(offer: dict[str, Any], search_key: str) -> dict[str, Any]:
     location = offer.get("location") or {}
     city = (location.get("city") or {}).get("name")
     region = (location.get("region") or {}).get("name")
+    seller = offer.get("user") or {}
+    photos = _photo_urls(offer)
 
     return {
         "id": offer["id"],
@@ -112,7 +115,12 @@ def normalise(offer: dict[str, Any], search_key: str) -> dict[str, Any]:
         "city": city,
         "region": region,
         "is_business": bool((offer.get("business")) or False),
-        "photo": _best_photo(offer),
+        "photo": photos[0] if photos else None,
+        "photos": json.dumps(photos) if photos else None,
+        "description": offer.get("description"),
+        "seller_id": seller.get("id"),
+        "seller_name": seller.get("name"),
+        "seller_since": seller.get("created"),
         "created_time": offer.get("created_time"),
         "last_refresh_time": offer.get("last_refresh_time"),
     }

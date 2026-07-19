@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -93,13 +93,16 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 );
 
 CREATE TABLE IF NOT EXISTS llm_analysis (
-    listing_id   INTEGER PRIMARY KEY,
-    ts           TEXT NOT NULL,
-    model        TEXT,
-    score        INTEGER,
-    scam_risk    TEXT,
-    summary      TEXT,
-    verdict_json TEXT
+    listing_id    INTEGER PRIMARY KEY,
+    ts            TEXT NOT NULL,
+    model         TEXT,
+    score         INTEGER,
+    scam_risk     TEXT,
+    summary       TEXT,
+    verdict_json  TEXT,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    cost_usd      REAL
 );
 """
 
@@ -158,6 +161,12 @@ class Store:
             if col not in cols:
                 self.conn.execute(
                     f"ALTER TABLE listings ADD COLUMN {col} {typ}")
+        acols = {r[1] for r in self.conn.execute("PRAGMA table_info(llm_analysis)")}
+        for col, typ in (("input_tokens", "INTEGER"),
+                         ("output_tokens", "INTEGER"), ("cost_usd", "REAL")):
+            if col not in acols:
+                self.conn.execute(
+                    f"ALTER TABLE llm_analysis ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         self.conn.close()
@@ -301,18 +310,34 @@ class Store:
             }
         return list(by_day.values())
 
-    def save_analysis(self, listing_id: int, model: str,
-                      verdict: dict[str, Any]) -> None:
+    def save_analysis(self, listing_id: int, model: str, verdict: dict[str, Any],
+                      usage: dict[str, Any] | None = None,
+                      cost: float | None = None) -> None:
         import json as _json
+        u = usage or {}
         self.conn.execute(
             "INSERT OR REPLACE INTO llm_analysis "
-            "(listing_id, ts, model, score, scam_risk, summary, verdict_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(listing_id, ts, model, score, scam_risk, summary, verdict_json, "
+            "input_tokens, output_tokens, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (listing_id, _now(), model, verdict.get("verdict_score"),
              verdict.get("scam_risk"), verdict.get("summary"),
-             _json.dumps(verdict, ensure_ascii=False)),
+             _json.dumps(verdict, ensure_ascii=False),
+             u.get("input_tokens"), u.get("output_tokens"), cost),
         )
         self.conn.commit()
+
+    def ai_cost(self, hours: int | None = None) -> tuple[int, float]:
+        """(#analyses, total cost USD) over a window (all-time if hours=None)."""
+        q = "SELECT COUNT(*) n, COALESCE(SUM(cost_usd), 0) c FROM llm_analysis"
+        params: tuple = ()
+        if hours:
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(hours=hours)).isoformat()
+            q += " WHERE ts >= ?"
+            params = (cutoff,)
+        r = self.conn.execute(q, params).fetchone()
+        return r["n"], r["c"]
 
     def get_analyses(self, ids: list[int]) -> dict[int, dict[str, Any]]:
         """Batch-fetch stored verdicts: {listing_id: row-with-verdict_json}."""

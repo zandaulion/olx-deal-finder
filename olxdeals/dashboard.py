@@ -991,8 +991,12 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             scope_txt = f"group '{group}'"
         else:
             scope_txt = f"{len(all_keys)} search(es)"
+        n24, c24 = store.ai_cost(24)
+        nT, cT = store.ai_cost()
+        ai_txt = (f" · AI ${c24:.2f}/24h · ${cT:.2f} total ({nT})"
+                  if nT else "")
         sub = (f"{scope_txt} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
-               f"EUR→RON {EUR_TO_RON}")
+               f"EUR→RON {EUR_TO_RON}{ai_txt}")
     finally:
         store.close()
     return _shell(sub, content, "deals", flash)

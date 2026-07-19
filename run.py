@@ -10,7 +10,6 @@ and print what's new / changed / gone.
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -45,37 +44,6 @@ def report(result: SyncResult, quiet: bool) -> None:
               f"{ch.listing['title'][:45]}\n          {ch.listing['url']}")
     if result.removed:
         print(f"  - {len(result.removed)} listing(s) no longer in results")
-
-
-MAX_ANALYSES_PER_SYNC = 10  # bound LLM cost even if many deals appear at once
-
-
-def analyze_new_deals(store, search_key, active, result, budget) -> int:
-    """Send newly-appeared deal listings to Claude (fail-soft, capped)."""
-    if budget <= 0 or not result.new or not os.environ.get("ANTHROPIC_API_KEY"):
-        return 0
-    try:  # lazy import: a missing/broken SDK must never break the sync
-        from olxdeals.analyzer import analyze
-    except Exception as exc:
-        print(f"[{search_key}] LLM analyzer unavailable: {exc}")
-        return 0
-    new_ids = {l["id"] for l in result.new}
-    already = store.get_analyses(list(new_ids))
-    done = 0
-    for sl in score_search(search_key, active).listings:
-        if done >= budget:
-            break
-        lid = sl.raw["id"]
-        if lid in new_ids and sl.is_deal and lid not in already:
-            try:
-                verdict = analyze(store, sl.raw)
-                done += 1
-                print(f"[{search_key}] LLM verdict for {lid}: "
-                      f"score={verdict['verdict_score']} "
-                      f"risk={verdict['scam_risk']}")
-            except Exception as exc:
-                print(f"[{search_key}] LLM analysis failed for {lid}: {exc}")
-    return done
 
 
 def notify_new_deals(store, push, search_key, active, result) -> None:
@@ -123,7 +91,6 @@ def main() -> None:
     push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
 
     failures = 0
-    llm_budget = MAX_ANALYSES_PER_SYNC
     with Store(args.db) as store:
         for spec in specs:
             started = time.monotonic()
@@ -143,9 +110,6 @@ def main() -> None:
             dist = price_distribution(active)
             if dist:
                 store.record_stats(spec.key, dist)
-            # Analyze before notifying so the push can carry the verdict.
-            llm_budget -= analyze_new_deals(store, spec.key, active, result,
-                                            llm_budget)
             notify_new_deals(store, push, spec.key, active, result)
             dur = int((time.monotonic() - started) * 1000)
             store.record_run(spec.key, ok=True, duration_ms=dur, result=result)

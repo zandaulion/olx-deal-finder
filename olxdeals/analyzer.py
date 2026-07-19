@@ -25,6 +25,15 @@ from .scorer import price_distribution, to_ron
 MODEL = "claude-opus-4-8"
 MAX_IMAGES = 4
 
+# Claude Opus 4.8 pricing (USD per token). Adaptive-thinking tokens are billed
+# as output. Update if pricing changes.
+PRICE_IN = 5.0 / 1_000_000
+PRICE_OUT = 25.0 / 1_000_000
+
+
+def cost_usd(input_tokens: int | None, output_tokens: int | None) -> float:
+    return (input_tokens or 0) * PRICE_IN + (output_tokens or 0) * PRICE_OUT
+
 _SYSTEM = """You are an expert analyst of second-hand marketplace listings on \
 OLX.ro (Romania). Listings are written in Romanian. You assess a single \
 listing for a buyer hunting genuine bargains, using the listing text, its \
@@ -156,5 +165,8 @@ def analyze(store, listing: dict[str, Any],
         output_format=Verdict,
     )
     verdict = response.parsed_output.model_dump()
-    store.save_analysis(listing["id"], MODEL, verdict)
+    u = response.usage
+    usage = {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens}
+    store.save_analysis(listing["id"], MODEL, verdict, usage,
+                        cost_usd(u.input_tokens, u.output_tokens))
     return verdict

@@ -90,10 +90,10 @@ self.addEventListener('notificationclick', (e) => {
 });
 """
 
-from . import config
+from . import config, fx, scorer
 from .discover import discover
 from .push import Push
-from .scorer import EUR_TO_RON, score_search, to_ron
+from .scorer import score_search, to_ron
 from .store import Store
 
 _CSS = """
@@ -996,7 +996,7 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         ai_txt = (f" · AI ${c24:.2f}/24h · ${cT:.2f} total ({nT})"
                   if nT else "")
         sub = (f"{scope_txt} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
-               f"EUR→RON {EUR_TO_RON}{ai_txt}")
+               f"EUR→RON {scorer.EUR_TO_RON:.2f}{ai_txt}")
     finally:
         store.close()
     return _shell(sub, content, "deals", flash)
@@ -1578,7 +1578,16 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
+    def _apply_fx(self) -> None:
+        """Load the cached EUR→RON rate so conversions/display are current."""
+        store = Store(self.db_path)
+        try:
+            scorer.EUR_TO_RON = fx.current(store)
+        finally:
+            store.close()
+
     def do_GET(self):
+        self._apply_fx()
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         flash = qs.get("msg", [""])[0]
@@ -1636,6 +1645,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        self._apply_fx()
         parsed = urllib.parse.urlparse(self.path)
         try:
             if parsed.path == "/searches/add":

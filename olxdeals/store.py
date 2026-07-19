@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     created  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT,
+    updated TEXT
+);
+
 CREATE TABLE IF NOT EXISTS llm_analysis (
     listing_id    INTEGER PRIMARY KEY,
     ts            TEXT NOT NULL,
@@ -325,6 +331,17 @@ class Store:
              _json.dumps(verdict, ensure_ascii=False),
              u.get("input_tokens"), u.get("output_tokens"), cost),
         )
+        self.conn.commit()
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        r = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r else default
+
+    def set_meta(self, key: str, value: Any) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value, updated) VALUES (?, ?, ?)",
+            (key, str(value), _now()))
         self.conn.commit()
 
     def ai_cost(self, hours: int | None = None) -> tuple[int, float]:

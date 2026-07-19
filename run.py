@@ -13,6 +13,7 @@ import argparse
 import time
 from pathlib import Path
 
+from olxdeals import fx, scorer
 from olxdeals.config import load_searches
 from olxdeals.fetcher import OlxFetcher
 from olxdeals.push import Push
@@ -92,6 +93,8 @@ def main() -> None:
 
     failures = 0
     with Store(args.db) as store:
+        # Refresh the EUR→RON rate (~once/day) so conversions stay accurate.
+        scorer.EUR_TO_RON = fx.refresh(store)
         for spec in specs:
             started = time.monotonic()
             try:

@@ -253,6 +253,7 @@ _CSS = """
   .srow .info { flex:1; min-width:0; }
   .srow .k { font-weight:600; }
   .srow .d { color:#8a93a2; font-size:12px; }
+  .srow.paused { opacity:0.6; }
   .note { color:#8a93a2; font-size:12px; margin:6px 16px; }
   .flash { margin:10px 16px; padding:10px; border-radius:8px; background:#16321f;
            color:#c9f5d9; border:1px solid #1e5f3c; font-size:13px; }
@@ -1380,9 +1381,15 @@ function setModel(k){
 
     def srow(s: dict) -> str:
         key = html.escape(s.get("key", ""))
-        return f"""<div class="srow">
-  <div class="info"><div class="k">{key}</div>
+        paused = bool(s.get("paused"))
+        badge = ' <span class="badge b-susp">paused</span>' if paused else ''
+        return f"""<div class="srow{' paused' if paused else ''}">
+  <div class="info"><div class="k">{key}{badge}</div>
     <div class="d">{html.escape(_search_summary(s))}</div></div>
+  <form method="post" action="/searches/pause" style="margin:0">
+    <input type="hidden" name="key" value="{key}">
+    <button class="btn" type="submit">{'Resume' if paused else 'Pause'}</button>
+  </form>
   <a class="btn" href="/searches?edit={urllib.parse.quote(s.get('key',''))}">Edit</a>
   <form method="post" action="/searches/delete" style="margin:0"
         onsubmit="return confirm('Delete {key}?')">
@@ -1659,6 +1666,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._deactivate(key)
                 self._redirect("/searches?msg=" + urllib.parse.quote(
                     f"Deleted '{key}'."))
+            elif parsed.path == "/searches/pause":
+                key = self._form().get("key", "")
+                paused = config.toggle_paused(self.config_path, key)
+                self._redirect("/searches?msg=" + urllib.parse.quote(
+                    f"'{key}' {'paused — no longer refreshing' if paused else 'resumed'}."))
             elif parsed.path == "/exclude":
                 form = self._form()
                 lid = _int_or_none(form.get("id"))

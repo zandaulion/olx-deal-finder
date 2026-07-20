@@ -52,6 +52,7 @@ class SearchSpec:
     price_from: int | None = None
     price_to: int | None = None
     region_id: int | None = None
+    paused: bool = False  # when true, the sync skips this search (data frozen)
 
     def build_params(self, offset: int, limit: int) -> list[tuple[str, str]]:
         """Build the flat query params OLX expects (order-insensitive)."""

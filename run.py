@@ -96,6 +96,9 @@ def main() -> None:
         # Refresh the EUR→RON rate (~once/day) so conversions stay accurate.
         scorer.EUR_TO_RON = fx.refresh(store)
         for spec in specs:
+            if spec.paused:
+                print(f"[{spec.key}] paused — skipped")
+                continue
             started = time.monotonic()
             try:
                 # Fetch fully before touching the DB: a mid-pagination failure

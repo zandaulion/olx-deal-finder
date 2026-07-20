@@ -28,10 +28,29 @@ def save_raw(path: str | Path, data: dict) -> None:
 def upsert_search(path: str | Path, search: dict) -> None:
     """Add a search, or replace an existing one with the same key."""
     data = load_raw(path)
+    old = next((s for s in data["searches"]
+                if s.get("key") == search["key"]), None)
+    if old and old.get("paused"):  # editing shouldn't silently un-pause
+        search["paused"] = True
     searches = [s for s in data["searches"] if s.get("key") != search["key"]]
     searches.append(search)
     data["searches"] = searches
     save_raw(path, data)
+
+
+def toggle_paused(path: str | Path, key: str) -> bool:
+    """Flip a search's paused flag; returns the new state."""
+    data = load_raw(path)
+    new_state = False
+    for s in data["searches"]:
+        if s.get("key") == key:
+            new_state = not bool(s.get("paused"))
+            if new_state:
+                s["paused"] = True
+            else:
+                s.pop("paused", None)
+    save_raw(path, data)
+    return new_state
 
 
 def delete_search(path: str | Path, key: str) -> None:
@@ -54,6 +73,7 @@ def load_searches(path: str | Path) -> list[SearchSpec]:
                 price_from=raw.get("price_from"),
                 price_to=raw.get("price_to"),
                 region_id=raw.get("region_id"),
+                paused=bool(raw.get("paused")),
             )
         )
     if not specs:

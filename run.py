@@ -81,9 +81,9 @@ def notify_ntfy(summary: list[dict]) -> None:
     if bad:  # failures are urgent — max priority so they actually ping
         _post_ntfy(f"OLX sync: {len(ok)}/{len(summary)} ok, {len(bad)} FAILED",
                    body, "max", "rotating_light")
-    else:  # healthy heartbeat — quiet, logged to history
+    else:  # healthy heartbeat — lowest priority, silent, logged to history
         _post_ntfy(f"OLX sync: {len(ok)} ok, {total_new} new",
-                   body, "low", "white_check_mark")
+                   body, "min", "white_check_mark")
 
 
 def notify_new_deals(store, push, search_key, active, result) -> None:

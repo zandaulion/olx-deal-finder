@@ -10,6 +10,7 @@ and print what's new / changed / gone.
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -95,10 +96,10 @@ def main() -> None:
     with Store(args.db) as store:
         # Refresh the EUR→RON rate (~once/day) so conversions stay accurate.
         scorer.EUR_TO_RON = fx.refresh(store)
-        for spec in specs:
-            if spec.paused:
-                print(f"[{spec.key}] paused — skipped")
-                continue
+        active_specs = [s for s in specs if not s.paused]
+        for i, spec in enumerate(active_specs):
+            if i:  # gentle gap between searches to avoid burst-throttling
+                time.sleep(random.uniform(1.5, 3.5))
             started = time.monotonic()
             try:
                 # Fetch fully before touching the DB: a mid-pagination failure

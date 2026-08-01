@@ -14,7 +14,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-import requests
+# OLX now TLS-fingerprints clients and 403s plain python-requests, so we use
+# curl_cffi with a browser impersonation profile (real Chrome TLS handshake).
+from curl_cffi import requests
+
+IMPERSONATE = "chrome"
 
 API_URL = "https://www.olx.ro/api/v1/offers/"
 
@@ -33,7 +37,9 @@ PAGE_LIMIT = 50
 MAX_RESULTS = 1000
 
 # Transient statuses worth backing off and retrying rather than failing.
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+# OLX returns 403 for short-lived anti-bot throttling (not just hard blocks),
+# so back off on it too — a persistent 403 still fails after the retries.
+RETRY_STATUSES = {403, 429, 500, 502, 503, 504}
 MAX_BACKOFF = 30.0
 
 
@@ -146,7 +152,7 @@ class OlxFetcher:
         self.jitter = jitter
         self.timeout = timeout
         self.max_retries = max_retries
-        self.session = requests.Session()
+        self.session = requests.Session(impersonate=IMPERSONATE)
         self.session.headers.update(_HEADERS)
 
     def _backoff(self, attempt: int) -> float:
@@ -166,7 +172,7 @@ class OlxFetcher:
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self.session.get(API_URL, params=params, timeout=self.timeout)
-            except requests.RequestException as exc:
+            except requests.exceptions.RequestException as exc:
                 last_exc = exc
                 if attempt >= self.max_retries:
                     raise

@@ -16,10 +16,10 @@ import json
 from typing import Any, Literal
 
 import anthropic
-import requests
+from curl_cffi import requests  # browser-TLS client (OLX blocks plain requests)
 from pydantic import BaseModel, Field
 
-from .fetcher import API_URL, _HEADERS
+from .fetcher import API_URL, IMPERSONATE, _HEADERS
 from .scorer import price_distribution, to_ron
 
 MODEL = "claude-opus-4-8"
@@ -80,7 +80,7 @@ def _seller_context(seller_id: int | None, exclude_id: int) -> dict[str, Any]:
         resp = requests.get(
             API_URL, params=[("offset", "0"), ("limit", "20"),
                              ("user_id", str(seller_id))],
-            headers=_HEADERS, timeout=20)
+            headers=_HEADERS, impersonate=IMPERSONATE, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         items = []

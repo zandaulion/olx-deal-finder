@@ -3,3 +3,4 @@ PyYAML>=6.0
 pywebpush>=1.14
 cryptography>=42
 anthropic>=0.117
+curl_cffi>=0.7

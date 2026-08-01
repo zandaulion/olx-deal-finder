@@ -6,18 +6,75 @@ searches:
     - samsung_galaxy_fold6
   price_from: 1000
   price_to: 8000
+  group: Fold
+- key: samsung_galaxy_s25ultra_used
+  category_id: 0
+  filters:
+    model:
+    - samsung_galaxy_s25ultra
+  price_from: 1000
+  group: Phones
+  paused: true
+- key: touran_used
+  category_id: 0
+  filters:
+    model:
+    - touran
+  ranges:
+    year:
+      from: 2020
+      to: 2026
+    rulaj_pana:
+      to: 150000
+  price_from: 50000
+  group: Cars
+  paused: true
 - key: samsung_galaxy_fold5_used
   category_id: 0
+  group: Fold
   filters:
     model:
     - samsung_galaxy_fold5
+  price_from: 1000
 - key: samsung_galaxy_fold7_used
   category_id: 0
+  group: Fold
   filters:
     model:
     - samsung_galaxy_fold7
-- key: samsung_galaxy_fold4_used
+  price_from: 1000
+- key: samsung_galaxy_s24_ultra_used
+  category_id: 0
+  group: Phones
+  filters:
+    model:
+    - samsung_galaxy_s24_ultra
+  price_from: 1000
+  paused: true
+- key: mountainbike_used
+  category_id: 987
+  group: bike
+  price_from: 500
+  price_to: 2000
+  query: mountain bike
+  filters:
+    state:
+    - used
+    dimensiune_roata:
+    - 29_inch
+  paused: true
+- key: bike_27_5
+  category_id: 987
+  group: bike
+  filters:
+    dimensiune_roata:
+    - 27_5_inch
+  price_from: 500
+  price_to: 2000
+  paused: true
+- key: kindle_paperwhite_used
   category_id: 0
   filters:
     model:
-    - samsung_galaxy_fold4
+    - kindle_paperwhite
+  price_from: 200

@@ -10,9 +10,12 @@ and print what's new / changed / gone.
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import time
 from pathlib import Path
+
+import requests
 
 from olxdeals import fx, scorer
 from olxdeals.config import load_searches
@@ -46,6 +49,41 @@ def report(result: SyncResult, quiet: bool) -> None:
               f"{ch.listing['title'][:45]}\n          {ch.listing['url']}")
     if result.removed:
         print(f"  - {len(result.removed)} listing(s) no longer in results")
+
+
+NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh/monitoring")
+
+
+def _post_ntfy(title: str, body: str, priority: str, tags: str) -> None:
+    """POST one message to ntfy (fail-soft — never breaks the sync)."""
+    if not NTFY_URL:
+        return
+    try:
+        requests.post(NTFY_URL, data=body.encode("utf-8"), timeout=10,
+                      headers={"Title": title, "Priority": priority, "Tags": tags})
+    except Exception as exc:
+        print(f"ntfy notify failed: {exc}")
+
+
+def notify_ntfy(summary: list[dict]) -> None:
+    """Publish a per-sync status heartbeat to ntfy."""
+    ok = [s for s in summary if s["ok"]]
+    bad = [s for s in summary if not s["ok"]]
+    total_new = sum(s.get("new", 0) for s in ok)
+    lines = []
+    for s in summary:
+        if s["ok"]:
+            extra = f", {s['removed']} gone" if s.get("removed") else ""
+            lines.append(f"{s['key']}: {s.get('new', 0)} new{extra}")
+        else:
+            lines.append(f"{s['key']}: FAILED — {s['error'][:70]}")
+    body = "\n".join(lines) or "no active searches (all paused)"
+    if bad:  # failures are urgent — max priority so they actually ping
+        _post_ntfy(f"OLX sync: {len(ok)}/{len(summary)} ok, {len(bad)} FAILED",
+                   body, "max", "rotating_light")
+    else:  # healthy heartbeat — quiet, logged to history
+        _post_ntfy(f"OLX sync: {len(ok)} ok, {total_new} new",
+                   body, "low", "white_check_mark")
 
 
 def notify_new_deals(store, push, search_key, active, result) -> None:
@@ -88,15 +126,28 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    specs = load_searches(args.config)
     fetcher = OlxFetcher(delay=args.delay, jitter=args.jitter)
     push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
 
+    summary: list[dict] = []
+    try:
+        failures = _run_all(args, fetcher, push, summary)
+    except Exception as exc:  # total, unexpected crash — alert loudly, then exit
+        _post_ntfy("OLX sync CRASHED", str(exc)[:200], "max", "rotating_light")
+        raise
+
+    notify_ntfy(summary)
+    if failures:
+        raise SystemExit(1)
+
+
+def _run_all(args, fetcher, push, summary: list[dict]) -> int:
+    """Run the sync for every active search; return the failure count."""
     failures = 0
     with Store(args.db) as store:
         # Refresh the EUR→RON rate (~once/day) so conversions stay accurate.
         scorer.EUR_TO_RON = fx.refresh(store)
-        active_specs = [s for s in specs if not s.paused]
+        active_specs = [s for s in load_searches(args.config) if not s.paused]
         for i, spec in enumerate(active_specs):
             if i:  # gentle gap between searches to avoid burst-throttling
                 time.sleep(random.uniform(1.5, 3.5))
@@ -109,6 +160,7 @@ def main() -> None:
                 failures += 1
                 dur = int((time.monotonic() - started) * 1000)
                 store.record_run(spec.key, ok=False, duration_ms=dur, error=str(exc))
+                summary.append({"key": spec.key, "ok": False, "error": str(exc)})
                 print(f"[{spec.key}] FETCH FAILED: {exc}")
                 continue
             result = store.sync(listings, spec.key)
@@ -120,10 +172,10 @@ def main() -> None:
             notify_new_deals(store, push, spec.key, active, result)
             dur = int((time.monotonic() - started) * 1000)
             store.record_run(spec.key, ok=True, duration_ms=dur, result=result)
+            summary.append({"key": spec.key, "ok": True,
+                            "new": len(result.new), "removed": len(result.removed)})
             report(result, args.quiet)
-
-    if failures:
-        raise SystemExit(1)
+    return failures
 
 
 if __name__ == "__main__":

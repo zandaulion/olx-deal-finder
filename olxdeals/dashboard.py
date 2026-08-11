@@ -1619,11 +1619,21 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
+    # App-shell assets (no listing data) — must stay reachable without auth
+    # so mobile browsers can fetch them during PWA install (that fetch
+    # doesn't carry cached Basic Auth credentials, so gating them broke the
+    # home-screen icon).
+    _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js"}
+    _PUBLIC_PREFIXES = ("/static/",)
+
+    def _is_public(self, path: str) -> bool:
+        return path in self._PUBLIC_PATHS or path.startswith(self._PUBLIC_PREFIXES)
+
     def do_GET(self):
-        if not self._check_auth():
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._is_public(parsed.path) and not self._check_auth():
             return
         self._apply_fx()
-        parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         flash = qs.get("msg", [""])[0]
         selected = qs.get("search", [None])[0]

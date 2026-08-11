@@ -15,9 +15,12 @@ intended trust boundary.
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
 import html
 import json
 import mimetypes
+import os
 import re
 import subprocess
 import urllib.parse
@@ -1515,6 +1518,29 @@ class Handler(BaseHTTPRequestHandler):
     db_path = "olxdeals.db"
     config_path = "searches.yaml"
     push: "Push" = None  # set in main()
+    auth: tuple[str, str] | None = None  # (user, password) set in main(); None = auth disabled
+
+    def _check_auth(self) -> bool:
+        """HTTP Basic Auth gate. No-op (always True) when self.auth is None."""
+        if self.auth is None:
+            return True
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Basic "):
+            try:
+                user, _, pw = base64.b64decode(
+                    header[6:]).decode("utf-8").partition(":")
+            except (ValueError, UnicodeDecodeError):
+                user, pw = "", ""
+            if (hmac.compare_digest(user, self.auth[0])
+                    and hmac.compare_digest(pw, self.auth[1])):
+                return True
+        body = b"Authentication required"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="OLX Deals"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
 
     def _html(self, body: str, status: int = 200) -> None:
         data = body.encode("utf-8")
@@ -1594,6 +1620,8 @@ class Handler(BaseHTTPRequestHandler):
             store.close()
 
     def do_GET(self):
+        if not self._check_auth():
+            return
         self._apply_fx()
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -1652,6 +1680,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._check_auth():
+            return
         self._apply_fx()
         parsed = urllib.parse.urlparse(self.path)
         try:
@@ -1801,6 +1831,13 @@ def main() -> None:
     Handler.config_path = args.config
     # VAPID key lives next to the DB so the sync process finds the same one.
     Handler.push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
+    user = os.environ.get("DASHBOARD_USER")
+    password = os.environ.get("DASHBOARD_PASS")
+    if user and password:
+        Handler.auth = (user, password)
+        print("HTTP Basic Auth enabled")
+    else:
+        print("WARNING: DASHBOARD_USER/DASHBOARD_PASS not set — dashboard has NO auth")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"OLX dashboard on http://{args.host}:{args.port}/  (Ctrl-C to stop)")
     try:

@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 
-from .fetcher import API_URL, PAGE_LIMIT, _HEADERS
-import requests
+# Same curl_cffi impersonation as the fetcher — OLX TLS-fingerprints clients
+# and 403s plain python-requests.
+from curl_cffi import requests
+
+from .fetcher import API_URL, IMPERSONATE, PAGE_LIMIT, _HEADERS
 
 
 def discover(query: str, pages: int = 2) -> tuple[Counter, Counter]:
-    session = requests.Session()
+    session = requests.Session(impersonate=IMPERSONATE)
     session.headers.update(_HEADERS)
     categories: Counter = Counter()   # (id, type) -> count
     models: Counter = Counter()       # (key, label) -> count

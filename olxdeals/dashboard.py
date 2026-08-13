@@ -15,14 +15,17 @@ intended trust boundary.
 from __future__ import annotations
 
 import argparse
-import base64
+import hashlib
 import hmac
 import html
+import http.cookies
 import json
 import mimetypes
 import os
 import re
+import secrets
 import subprocess
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -262,7 +265,44 @@ _CSS = """
            color:#c9f5d9; border:1px solid #1e5f3c; font-size:13px; }
   .flash.warn { background:#3a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
   .flash code { background:#00000033; padding:1px 5px; border-radius:4px; }
+  .login-wrap { min-height:100vh; display:flex; align-items:center;
+          justify-content:center; padding:16px; }
+  form.login { width:100%; max-width:340px; background:#161a20;
+          border:1px solid #262c36; border-radius:12px; padding:20px; }
+  form.login h1 { margin:0 0 4px; font-size:18px; }
+  form.login label { display:block; font-size:12px; color:#8a93a2; margin:12px 0 3px; }
+  form.login input { width:100%; padding:9px; font-size:15px; background:#0f1115;
+          color:#e6e6e6; border:1px solid #2c333f; border-radius:8px; }
+  form.login button { width:100%; margin-top:16px; padding:10px; font-size:15px;
+          background:#2f5fd0; color:#fff; border:none; border-radius:8px; cursor:pointer; }
 """
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="ro"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OLX Deals — sign in</title>
+<style>{css}</style></head><body>
+<div class="login-wrap">
+<form class="login" method="post" action="/login">
+  <h1>OLX Deals</h1>
+  {error}
+  <input type="hidden" name="next" value="{next}">
+  <label>Username</label>
+  <input name="user" autocomplete="username" autofocus required>
+  <label>Password</label>
+  <input name="pass" type="password" autocomplete="current-password" required>
+  <button type="submit">Sign in</button>
+</form>
+</div>
+</body></html>"""
+
+
+def render_login(error: str, next_path: str) -> str:
+    error_html = ('<div class="flash warn">Wrong username or password</div>'
+                  if error else "")
+    return _LOGIN_PAGE.format(
+        css=_CSS, error=error_html, next=html.escape(next_path or "/"))
 
 _SHELL = """<!doctype html>
 <html lang="ro"><head>
@@ -1514,32 +1554,53 @@ def build_search(form: dict[str, str]) -> dict:
     return s
 
 
+SESSION_COOKIE = "olx_session"
+SESSION_TTL = 60 * 60 * 24 * 90  # 90 days — personal app, avoid re-login churn
+
+
+def _sign(secret: bytes, payload: str) -> str:
+    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 class Handler(BaseHTTPRequestHandler):
     db_path = "olxdeals.db"
     config_path = "searches.yaml"
     push: "Push" = None  # set in main()
     auth: tuple[str, str] | None = None  # (user, password) set in main(); None = auth disabled
+    secret: bytes = b""  # session-cookie signing key, set in main()
+
+    def _make_session_cookie(self) -> str:
+        expiry = int(time.time()) + SESSION_TTL
+        payload = f"{self.auth[0]}:{expiry}"
+        return f"{payload}:{_sign(self.secret, payload)}"
+
+    def _valid_session_cookie(self, token: str) -> bool:
+        user, _, rest = token.partition(":")
+        expiry_s, _, sig = rest.partition(":")
+        if not (user and expiry_s and sig):
+            return False
+        if not hmac.compare_digest(sig, _sign(self.secret, f"{user}:{expiry_s}")):
+            return False
+        try:
+            expiry = int(expiry_s)
+        except ValueError:
+            return False
+        return time.time() < expiry and hmac.compare_digest(user, self.auth[0])
 
     def _check_auth(self) -> bool:
-        """HTTP Basic Auth gate. No-op (always True) when self.auth is None."""
+        """Session-cookie gate. No-op (always True) when self.auth is None."""
         if self.auth is None:
             return True
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
-            try:
-                user, _, pw = base64.b64decode(
-                    header[6:]).decode("utf-8").partition(":")
-            except (ValueError, UnicodeDecodeError):
-                user, pw = "", ""
-            if (hmac.compare_digest(user, self.auth[0])
-                    and hmac.compare_digest(pw, self.auth[1])):
-                return True
-        body = b"Authentication required"
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="OLX Deals"')
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        jar = http.cookies.SimpleCookie()
+        jar.load(self.headers.get("Cookie", ""))
+        morsel = jar.get(SESSION_COOKIE)
+        if morsel and self._valid_session_cookie(morsel.value):
+            return True
+        next_path = self.path if self.command == "GET" else "/"
+        location = "/login"
+        if next_path not in ("/", "/login"):
+            location += "?next=" + urllib.parse.quote(next_path, safe="")
+        self._redirect(location)
         return False
 
     def _html(self, body: str, status: int = 200) -> None:
@@ -1623,7 +1684,7 @@ class Handler(BaseHTTPRequestHandler):
     # so mobile browsers can fetch them during PWA install (that fetch
     # doesn't carry cached Basic Auth credentials, so gating them broke the
     # home-screen icon).
-    _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js"}
+    _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js", "/login"}
     _PUBLIC_PREFIXES = ("/static/",)
 
     def _is_public(self, path: str) -> bool:
@@ -1662,6 +1723,10 @@ class Handler(BaseHTTPRequestHandler):
             edit_key = qs.get("edit", [None])[0]
             self._html(render_searches(
                 self.config_path, self.db_path, edit_key, flash))
+        elif parsed.path == "/login":
+            error = qs.get("error", [""])[0]
+            next_path = qs.get("next", ["/"])[0]
+            self._html(render_login(error, next_path))
         elif parsed.path == "/api/discover":
             q = qs.get("q", [""])[0].strip()
             cats: list = []
@@ -1690,12 +1755,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if not self._check_auth():
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._is_public(parsed.path) and not self._check_auth():
             return
         self._apply_fx()
-        parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path == "/searches/add":
+            if parsed.path == "/login":
+                form = self._form()
+                next_path = form.get("next") or "/"
+                if not next_path.startswith("/") or next_path.startswith("//"):
+                    next_path = "/"  # only ever redirect within this app
+                if (self.auth is not None
+                        and hmac.compare_digest(form.get("user", ""), self.auth[0])
+                        and hmac.compare_digest(form.get("pass", ""), self.auth[1])):
+                    self.send_response(303)
+                    self.send_header("Location", next_path)
+                    self.send_header(
+                        "Set-Cookie",
+                        f"{SESSION_COOKIE}={self._make_session_cookie()}; Path=/; "
+                        f"Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Lax")
+                    self.end_headers()
+                else:
+                    self._redirect("/login?error=1&next="
+                                    + urllib.parse.quote(next_path, safe=""))
+            elif parsed.path == "/searches/add":
                 search = build_search(self._form())
                 config.upsert_search(self.config_path, search)
                 self._redirect("/searches?msg=" + urllib.parse.quote(
@@ -1845,7 +1928,13 @@ def main() -> None:
     password = os.environ.get("DASHBOARD_PASS")
     if user and password:
         Handler.auth = (user, password)
-        print("HTTP Basic Auth enabled")
+        # Persisted so sessions survive dashboard restarts/deploys.
+        secret_path = Path(args.db).resolve().with_name("session_secret.key")
+        if not secret_path.exists():
+            secret_path.write_bytes(secrets.token_bytes(32))
+            secret_path.chmod(0o600)
+        Handler.secret = secret_path.read_bytes()
+        print("Login (session cookie) auth enabled")
     else:
         print("WARNING: DASHBOARD_USER/DASHBOARD_PASS not set — dashboard has NO auth")
     server = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -6,6 +6,9 @@
 # VAPID private key for web-push (secret; generated on first run)
 vapid_key.pem
 
+# Session-cookie signing key (secret; generated on first run)
+session_secret.key
+
 # Python
 __pycache__/
 *.py[cod]

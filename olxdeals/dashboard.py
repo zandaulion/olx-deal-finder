@@ -219,6 +219,8 @@ _CSS = """
   .controls input.px { width:72px; }
   .controls .apply { background:#2f5fd0; color:#fff; border-color:#2f5fd0;
           cursor:pointer; }
+  form.mark-all { display:flex; justify-content:flex-end; margin:2px 16px 0; }
+  form.mark-all button { font-size:13px; }
   .card.deal { border-color:#2f7d4f; background:#132018; }
   .olx { color:inherit; text-decoration:none; }
   .imglink { flex:none; display:block; line-height:0; }
@@ -930,6 +932,44 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
             f'<summary>{summary}</summary>{form}</details>')
 
 
+def _matching_active_ids(db_path: str, config_path: str, selected: str | None,
+                         group: str | None, seller: str, pmin: int | None,
+                         pmax: int | None) -> list[int]:
+    """Ids of active, not-yet-seen listings matching the given scope+filters
+    (mirrors render_deals' `keep()`, minus the DISPLAY_CAP) — used by the
+    'mark all read' bulk action so it clears exactly what's on screen."""
+    all_keys = _search_keys(config_path, db_path)
+    groups, _kg = _search_groups(config_path, db_path)
+    if selected in all_keys:
+        show = [selected]
+    elif group in groups:
+        show = groups[group]
+    else:
+        show = all_keys
+    store = Store(db_path)
+    try:
+        ids = []
+        for key in show:
+            for r in store.active_for_search(key):
+                if r.get("seen"):
+                    continue
+                p = to_ron(r.get("price"), r.get("currency"))
+                if p is None or p <= 0:
+                    continue
+                if seller == "private" and r.get("is_business"):
+                    continue
+                if seller == "dealer" and not r.get("is_business"):
+                    continue
+                if pmin is not None and p < pmin:
+                    continue
+                if pmax is not None and p > pmax:
+                    continue
+                ids.append(r["id"])
+        return ids
+    finally:
+        store.close()
+
+
 def render_deals(db_path: str, config_path: str, selected: str | None = None,
                  group: str | None = None, flash: str = "",
                  filters: dict | None = None) -> str:
@@ -1013,6 +1053,7 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         else:  # deal %
             pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
         pool.sort(key=lambda t: bool(t[1].raw.get("seen")))  # unseen first, stable
+        has_unseen = bool(pool) and not pool[0][1].raw.get("seen")
         pool = pool[:DISPLAY_CAP]  # bound page weight after sort/filter
 
         analyses = store.get_analyses([l.raw["id"] for _, l, _ in pool])
@@ -1025,10 +1066,21 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         else:
             body = ('<div class="empty">No searches yet. '
                     'Add one on Manage, then Sync now.</div>')
+        mark_all = ""
+        if has_unseen:
+            mark_all = f"""<form class="mark-all" method="post" action="/mark_all_seen">
+  <input type="hidden" name="search" value="{html.escape(selected or '')}">
+  <input type="hidden" name="group" value="{html.escape(group or '')}">
+  <input type="hidden" name="seller" value="{html.escape(seller)}">
+  <input type="hidden" name="pmin" value="{pmin if pmin is not None else ''}">
+  <input type="hidden" name="pmax" value="{pmax if pmax is not None else ''}">
+  <input type="hidden" name="next" value="{html.escape(_tab_href('/'))}">
+  <button class="btn" type="submit">Mark all read</button>
+</form>"""
         menu = _grouped_menu(groups, "/", selected, group, counts,
                              (total_active, total_deals))
         content = (_sync_banner(store) + menu
-                   + _controls_bar(selected, group, f) + body)
+                   + _controls_bar(selected, group, f) + mark_all + body)
         if scope == "search":
             scope_txt = f"'{selected}'"
         elif scope == "group":
@@ -1825,6 +1877,23 @@ class Handler(BaseHTTPRequestHandler):
                         store.close()
                 self.send_response(204)  # async star / seen toggle
                 self.end_headers()
+            elif parsed.path == "/mark_all_seen":
+                form = self._form()
+                pmin = _int_or_none(form.get("pmin"))
+                pmax = _int_or_none(form.get("pmax"))
+                ids = _matching_active_ids(
+                    self.db_path, self.config_path,
+                    form.get("search") or None, form.get("group") or None,
+                    form.get("seller", "all"), pmin, pmax)
+                store = Store(self.db_path)
+                try:
+                    store.mark_seen_bulk(ids)
+                finally:
+                    store.close()
+                next_path = form.get("next") or "/"
+                if not next_path.startswith("/") or next_path.startswith("//"):
+                    next_path = "/"
+                self._redirect(next_path)
             elif parsed.path == "/push/subscribe":
                 sub = self._json_body()
                 if sub.get("endpoint"):

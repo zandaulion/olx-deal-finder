@@ -278,6 +278,14 @@ class Store:
     def set_seen(self, listing_id: int, value: bool) -> None:
         self._set_flag("seen", listing_id, value)
 
+    def mark_seen_bulk(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"UPDATE listings SET seen = 1 WHERE id IN ({placeholders})", ids)
+        self.conn.commit()
+
     def favorite_listings(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM listings WHERE active = 1 AND excluded = 0 "

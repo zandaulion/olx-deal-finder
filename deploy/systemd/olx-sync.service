@@ -1,7 +1,0 @@
-[Unit]
-Description=OLX Deals sync (fetch + diff, one shot)
-
-[Service]
-Type=oneshot
-WorkingDirectory=~/Projects/OLX
-ExecStart=/usr/bin/python3 run.py --config ~/Projects/OLX/searches.yaml --db ~/Projects/OLX/olxdeals.db --quiet

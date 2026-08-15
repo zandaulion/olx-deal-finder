@@ -1,0 +1,27 @@
+[Unit]
+Description=OLX deal finder dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/olx-deals:latest
+ContainerName=olx-deals
+# Loopback only: reachable through Caddy, never directly from the network.
+PublishPort=127.0.0.1:8092:8000
+# Database, searches.yaml and vapid_key.pem. Named volume so rebuilding the
+# image never touches the data -- and never regenerates the VAPID key, which
+# would silently invalidate every push subscription.
+Volume=olx-deals-data:/data
+# Secrets: ANTHROPIC_API_KEY, DASHBOARD_USER, DASHBOARD_PASS, NTFY_URL.
+# Owned by the service user, 0600, outside the repo. Rootless podman parses
+# this itself, as that user -- root ownership would only make it unreadable.
+EnvironmentFile=%h/.config/olx-deals/olx.env
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

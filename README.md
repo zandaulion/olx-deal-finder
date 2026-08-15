@@ -62,17 +62,60 @@ python -m olxdeals.discover "iphone 15 pro"
 Prints the category ids and model keys that actually appear in real listings, with counts.
 The dashboard's Manage tab has the same finder as tappable chips.
 
-## Always-on (systemd user services)
+## Always-on (rootless podman)
 
-Reference unit files are in [`deploy/systemd/`](deploy/systemd). They run an **hourly sync**
-and keep the **dashboard** up across logout/reboot. Adjust the paths to your checkout, then:
+[`deploy/`](deploy) runs the dashboard as a rootless container with an hourly
+sync, surviving logout and reboot. No root, no system-wide Python.
 
 ```bash
-cp deploy/systemd/*.service deploy/systemd/*.timer ~/.config/systemd/user/
-loginctl enable-linger "$USER"          # run without being logged in
+podman build -t olx-deals:latest -f deploy/Containerfile .
+loginctl enable-linger "$USER"                       # run without being logged in
+
+install -d -m 700 ~/.config/olx-deals
+cat > ~/.config/olx-deals/olx.env <<'ENV'
+DASHBOARD_USER=you
+DASHBOARD_PASS=something-long
+NTFY_URL=https://ntfy.sh/pick-something-unguessable
+ANTHROPIC_API_KEY=
+ENV
+chmod 600 ~/.config/olx-deals/olx.env
+
+cp deploy/quadlet/olx-deals.container ~/.config/containers/systemd/
+cp deploy/quadlet/olx-sync.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now olx-dashboard.service olx-sync.timer
+systemctl --user start olx-deals.service
+systemctl --user enable --now olx-sync.timer
 ```
+
+The dashboard listens on `127.0.0.1:8092`; put a reverse proxy in front of it
+if you want it reachable from elsewhere.
+
+Everything mutable lives in the named volume `olx-deals-data`: `olxdeals.db`,
+`searches.yaml` (the Manage tab writes to it) and `vapid_key.pem`. **The VAPID
+key must survive rebuilds** — regenerating it silently invalidates every push
+subscription already granted, with no error anywhere.
+
+Two things that are easy to get wrong:
+
+* `DASHBOARD_USER`/`DASHBOARD_PASS` are what stand between the dashboard and
+  whoever can reach it. Unset, it serves with **no authentication at all** and
+  only prints a warning. Set them before exposing it.
+* `NTFY_URL` defaults to `https://ntfy.sh/monitoring`, a public topic anyone
+  can read and post to. Pick your own.
+* The env file is read by *rootless podman itself*, as your user — so it must
+  be owned by you, not root. Root ownership just makes it unreadable.
+
+### Moving an existing install
+
+`deploy/import-data.sh` loads a previous dataset into the volume:
+
+```bash
+tar czf olx-data.tgz olxdeals.db searches.yaml vapid_key.pem   # on the old host
+./deploy/import-data.sh <dir-with-those-files>                 # on the new one
+```
+
+It stops the service, copies through `podman cp` so ownership lands right, and
+starts it again. Bring `vapid_key.pem` — see above.
 
 ## Layout
 
@@ -84,11 +127,22 @@ olxdeals/
   discover.py    find category ids & model keys from real listings
   config.py      read/write searches.yaml
   dashboard.py   zero-dependency web UI (Deals / Drops / Manage)
+  analyzer.py    optional per-listing LLM verdict (Anthropic)
+  push.py        self-served VAPID web push
 run.py           one sync cycle (used by the timer)
 searches.yaml    your tracked searches
+deploy/          Containerfile, quadlet units, data import
 ```
 
 ## Notes
 
 - The `EUR→RON` rate is a constant in `scorer.py` — update it occasionally.
 - The local `olxdeals.db` is git-ignored; it's rebuilt by running the sync.
+- The ✦ analyze button calls Anthropic and costs real money per listing —
+  a few cents each at Opus pricing. `llm_analysis.cost_usd` records what each
+  one cost. Leave `ANTHROPIC_API_KEY` empty and the rest of the app works
+  unchanged; only that button fails.
+
+## Licence
+
+[GNU GPL v3](LICENSE).

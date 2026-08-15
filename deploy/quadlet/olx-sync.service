@@ -1,0 +1,11 @@
+[Unit]
+Description=OLX deal finder sync (one shot)
+After=olx-deals.service
+Requires=olx-deals.service
+
+[Service]
+Type=oneshot
+# Runs inside the already-running dashboard container: same image, same
+# volume, same environment -- nothing to keep in step separately.
+ExecStart=/usr/bin/podman exec olx-deals python run.py \
+    --config /data/searches.yaml --db /data/olxdeals.db --quiet

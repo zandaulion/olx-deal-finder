@@ -1,0 +1,26 @@
+FROM docker.io/library/python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY olxdeals ./olxdeals
+COPY run.py ./
+
+# Everything mutable lives in /data: the SQLite database, searches.yaml (the
+# dashboard edits it), and vapid_key.pem, which the app places next to the
+# database. Losing that key silently invalidates every push subscription.
+RUN useradd --system --uid 10002 --no-create-home appuser \
+ && mkdir -p /data && chown 10002:10002 /data
+VOLUME /data
+
+USER 10002
+EXPOSE 8000
+CMD ["python", "-m", "olxdeals.dashboard", \
+     "--db", "/data/olxdeals.db", "--config", "/data/searches.yaml", \
+     "--host", "0.0.0.0", "--port", "8000"]

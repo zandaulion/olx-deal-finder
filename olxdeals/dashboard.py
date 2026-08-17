@@ -24,12 +24,13 @@ import mimetypes
 import os
 import re
 import secrets
-import subprocess
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -1970,12 +1971,50 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
+    # One at a time: a second Refresh while the first is still fetching would
+    # duplicate every request for no benefit.
+    _sync_lock = threading.Lock()
+    _sync_thread: threading.Thread | None = None
+
+    @classmethod
+    def sync_running(cls) -> bool:
+        t = cls._sync_thread
+        return bool(t and t.is_alive())
+
     def _trigger_sync(self) -> None:
-        # --no-block so the HTTP request returns immediately.
-        subprocess.run(
-            ["systemctl", "--user", "start", "--no-block", "olx-sync.service"],
-            timeout=10, check=False,
-        )
+        """Run one sync cycle in a thread of this process.
+
+        This used to ask systemd to start olx-sync.service, which runs
+        `podman exec olx-deals python run.py` -- issued from inside that very
+        container, where there is no systemctl and no podman. It had been
+        failing with ENOENT ever since the dashboard was containerised. The
+        unit and its hourly timer are unchanged; this is the same work, in the
+        process that already holds the database and the config.
+        """
+        with Handler._sync_lock:
+            if Handler.sync_running():
+                return
+            Handler._sync_thread = threading.Thread(
+                target=self._sync_once, name="olx-sync", daemon=True)
+            Handler._sync_thread.start()
+
+    @classmethod
+    def _sync_once(cls) -> None:
+        # Imported here rather than at module load: the dashboard has to start
+        # even if a sync dependency is unhappy, and this is the rarer path.
+        import run as sync
+
+        args = SimpleNamespace(config=cls.config_path, db=cls.db_path,
+                               delay=1.0, jitter=0.5, quiet=True)
+        summary: list[dict] = []
+        try:
+            fetcher = sync.OlxFetcher(delay=args.delay, jitter=args.jitter)
+            push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
+            sync._run_all(args, fetcher, push, summary)
+            sync.notify_ntfy(summary)
+        except Exception as exc:  # noqa: BLE001 -- a background thread has
+            # nowhere to raise; the log is the only place this can surface.
+            print(f"sync failed: {exc}", flush=True)
 
     def log_message(self, *a):
         pass

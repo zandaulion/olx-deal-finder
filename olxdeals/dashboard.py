@@ -23,7 +23,9 @@ import json
 import mimetypes
 import os
 import re
+import queue
 import secrets
+import socket
 import threading
 import time
 import urllib.parse
@@ -32,6 +34,54 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+
+class SyncTracker:
+    """Thread-safe tracker for live sync progress and SSE streaming."""
+    _lock = threading.Lock()
+    _state: dict[str, Any] = {
+        "running": False,
+        "step": 0,
+        "total": 0,
+        "current_key": "",
+        "new_count": 0,
+        "deal_count": 0,
+        "message": "Idle",
+        "started_at": None,
+        "finished_at": None,
+        "version": 0,
+    }
+    _listeners: list[queue.Queue] = []
+
+    @classmethod
+    def get_state(cls) -> dict[str, Any]:
+        with cls._lock:
+            return dict(cls._state)
+
+    @classmethod
+    def update(cls, **kwargs) -> None:
+        with cls._lock:
+            cls._state.update(kwargs)
+            cls._state["version"] += 1
+            st = dict(cls._state)
+            for q in cls._listeners[:]:
+                try:
+                    q.put_nowait(st)
+                except Exception:
+                    pass
+
+    @classmethod
+    def register_listener(cls) -> queue.Queue:
+        q = queue.Queue(maxsize=50)
+        with cls._lock:
+            cls._listeners.append(q)
+        return q
+
+    @classmethod
+    def unregister_listener(cls, q: queue.Queue) -> None:
+        with cls._lock:
+            if q in cls._listeners:
+                cls._listeners.remove(q)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -43,8 +93,8 @@ MANIFEST = {
     "scope": "/",
     "display": "standalone",
     "orientation": "portrait",
-    "background_color": "#0f1115",
-    "theme_color": "#0f1115",
+    "background_color": "#090c10",
+    "theme_color": "#090c10",
     "icons": [
         {"src": "/static/icon-192.png", "sizes": "192x192",
          "type": "image/png", "purpose": "any maskable"},
@@ -55,7 +105,7 @@ MANIFEST = {
 
 # Network-first so live data stays fresh; falls back to cache (offline shell).
 SW_JS = """
-const CACHE = 'olx-deals-v3';
+const CACHE = 'olx-deals-v4';
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/manifest.webmanifest'])));
   self.skipWaiting();
@@ -97,205 +147,1041 @@ self.addEventListener('notificationclick', (e) => {
 });
 """
 
-from . import config, fx, scorer
+from . import analytics, config, fx, scorer
 from .discover import discover
 from .push import Push
 from .scorer import score_search, to_ron
 from .store import Store
 
 _CSS = """
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
-         background:#0f1115; color:#e6e6e6;
-         padding-bottom:calc(60px + env(safe-area-inset-bottom)); }
-  /* Centered, width-capped column so it doesn't stretch on desktop. */
-  .wrap { max-width:1200px; margin:0 auto; width:100%; }
-  header { padding:10px 16px; background:#161a20; position:sticky; top:0;
-           border-bottom:1px solid #262c36; z-index:5;
-           padding-top:calc(10px + env(safe-area-inset-top)); }
-  header h1 { margin:0; font-size:18px; }
-  header .sub { color:#8a93a2; font-size:12px; margin-top:3px; }
-  .topbar { display:flex; align-items:center; justify-content:space-between; }
-  .topbar form { margin:0; }
-  .actions { display:flex; gap:8px; }
-  .iconbtn { background:#20252e; border:1px solid #2c333f; color:#cbd3df;
-        width:40px; height:40px; border-radius:10px; font-size:19px; cursor:pointer;
-        display:flex; align-items:center; justify-content:center; padding:0; }
-  .iconbtn:active { background:#2c333f; }
-  .btn { display:inline-block; padding:6px 12px; border-radius:8px;
-        font-size:13px; text-decoration:none; background:#20252e; color:#cbd3df;
-        border:1px solid #2c333f; cursor:pointer; }
-  .btn-go { background:#1e5f3c; color:#c9f5d9; border-color:#1e5f3c; }
-  .btn-del { background:#4a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
-  .tabbar { position:fixed; left:0; right:0; bottom:0; z-index:10;
-        background:#161a20; border-top:1px solid #262c36;
-        padding-bottom:env(safe-area-inset-bottom); }
-  .tabbar .wrap { display:flex; }
-  .tabbar a { flex:1; display:flex; flex-direction:column; align-items:center;
-        gap:2px; padding:7px 2px 8px; color:#8a93a2; text-decoration:none;
-        font-size:10px; }
-  /* Card list: single column on mobile, responsive grid on wider screens. */
-  @media (min-width:760px) {
-    .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
-             gap:12px; padding:4px 16px; }
-    .cards .card { margin:0; }
-    .card .thumb { width:96px; height:96px; }
-    /* Single-column UI shouldn't stretch across the full grid width. */
-    .chart { max-width:620px; }
-    .mng, .srow { max-width:660px; }
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap');
+
+  :root, [data-theme="dark"] {
+    color-scheme: dark;
+    --bg-canvas: #090c10;
+    --bg-header: rgba(13, 17, 23, 0.88);
+    --bg-surface: #121824;
+    --bg-surface-elevated: #1a2233;
+    --bg-surface-hover: #222d42;
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-medium: rgba(255, 255, 255, 0.14);
+    --border-focus: rgba(99, 102, 241, 0.5);
+
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --text-tertiary: #64748b;
+
+    --accent-brand: #3b82f6;
+    --accent-brand-bg: rgba(59, 130, 246, 0.14);
+    --accent-deal: #10b981;
+    --accent-deal-bg: rgba(16, 185, 129, 0.14);
+    --accent-deal-border: rgba(16, 185, 129, 0.38);
+    --accent-drop: #f59e0b;
+    --accent-drop-bg: rgba(245, 158, 11, 0.14);
+    --accent-new: #06b6d4;
+    --accent-new-bg: rgba(6, 182, 212, 0.14);
+    --accent-fav: #fbbf24;
+    --accent-susp: #c084fc;
+    --accent-susp-bg: rgba(192, 132, 252, 0.14);
+    --accent-danger: #f43f5e;
+    --accent-danger-bg: rgba(244, 63, 94, 0.15);
+
+    --bg-card-unread: #121824;
+    --bg-card-read: #0b0e15;
+    --border-card-unread: rgba(255, 255, 255, 0.08);
+    --border-card-read: rgba(255, 255, 255, 0.04);
+
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-pill: 9999px;
+
+    --shadow-card: 0 4px 18px -2px rgba(0, 0, 0, 0.45), 0 2px 6px -1px rgba(0, 0, 0, 0.3);
+    --shadow-float: 0 12px 36px -4px rgba(0, 0, 0, 0.7);
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-heading: 'Outfit', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
   }
-  .tabbar a .ic { font-size:19px; line-height:1.1; }
-  .tabbar a.active { color:#4f8bff; }
-  .filterbox { margin:8px 16px 0; }
-  .filterbox > summary { list-style:none; cursor:pointer; color:#8a93a2;
-        font-size:13px; padding:5px 0; display:flex; align-items:center; gap:6px; }
-  .filterbox > summary::-webkit-details-marker { display:none; }
-  .filterbox > summary::before { content:'\\25B8'; font-size:11px; }
-  .filterbox[open] > summary::before { content:'\\25BE'; }
-  .search { padding:10px 16px 4px; font-size:13px; color:#8a93a2; }
-  .search b { color:#cbd3df; }
-  .menu { margin:10px 16px 0; }
-  .menu > summary { list-style:none; cursor:pointer; padding:9px 12px;
-          border-radius:8px; background:#20252e; border:1px solid #2c333f;
-          color:#e6e6e6; font-size:14px; display:flex; align-items:center; gap:10px; }
-  .menu > summary::-webkit-details-marker { display:none; }
-  .menu > summary .burger { font-size:16px; color:#8a93a2; }
-  .menu > summary .caret { margin-left:auto; color:#8a93a2; transition:transform .15s; }
-  .menu[open] > summary { border-color:#2f5fd0; }
-  .menu[open] > summary .caret { transform:rotate(180deg); }
-  .menu .items { margin-top:6px; border:1px solid #2c333f; border-radius:8px;
-          overflow:hidden; }
-  .menu .items a { display:flex; justify-content:space-between; align-items:center;
-          gap:10px; padding:11px 12px; color:#cbd3df; text-decoration:none;
-          border-bottom:1px solid #20252e; font-size:14px; }
-  .menu .items a:last-child { border-bottom:none; }
-  .menu .items a.on { background:#2f5fd0; color:#fff; }
-  .menu .items a .stat { color:#8a93a2; font-size:12px; white-space:nowrap; }
-  .menu .items a.on .stat { color:#cdd9ff; }
-  .menu .sstat { color:#8a93a2; font-size:12px; margin-left:6px; }
-  .menu .dl { color:#5fd08a; }
-  .menu .grp { border-bottom:1px solid #20252e; }
-  .menu .grp > summary { list-style:none; cursor:pointer; display:flex;
-        align-items:center; gap:10px; padding:11px 12px; font-size:14px; }
-  .menu .grp > summary::-webkit-details-marker { display:none; }
-  .menu .grp-name { color:#e6e6e6; text-decoration:none; font-weight:600; flex:1; }
-  .menu .grp-name.on { color:#4f8bff; }
-  .menu .grp-caret { color:#8a93a2; font-size:11px; transition:transform .15s; }
-  .menu .grp[open] > summary .grp-caret { transform:rotate(90deg); }
-  .menu .grp-items a { padding-left:28px; background:#0f1115; }
-  .card { display:flex; gap:12px; margin:10px 16px; padding:10px; position:relative;
-          background:#161a20; border:1px solid #262c36; border-radius:12px;
-          -webkit-touch-callout:none; touch-action:pan-y; }
-  .card.sw-fav { box-shadow:inset 7px 0 0 -2px #f0c040; }
-  .card.sw-seen { box-shadow:inset -7px 0 0 -2px #4f8bff; }
-  .hide-btn { position:absolute; top:6px; right:8px; width:26px; height:26px;
-          border-radius:50%; background:#20252e; color:#8a93a2; z-index:2;
-          display:flex; align-items:center; justify-content:center; font-size:14px;
-          border:1px solid #2c333f; }
-  .hide-btn:active { background:#4a1f1f; color:#f0b6b6; }
-  .card.seen { opacity:0.5; }
-  .fav-btn { position:absolute; top:6px; left:8px; width:26px; height:26px;
-          border-radius:50%; background:#20252ecc; color:#8a93a2; z-index:2;
-          display:flex; align-items:center; justify-content:center; font-size:15px;
-          border:1px solid #2c333f; }
-  .fav-btn.on { color:#f0c040; border-color:#6b5a1e; }
-  .seen-btn { display:inline-block; margin-top:5px; font-size:12px; color:#8a93a2;
-          border:1px solid #2c333f; border-radius:6px; padding:2px 9px; }
-  .seen-btn.on { color:#8fd0a0; border-color:#2f5f3c; }
-  .b-new { background:#123a3a; color:#a6eaea; }
-  .ai-badge { cursor:pointer; }
-  .ai-good { background:#1e5f3c; color:#c9f5d9; }
-  .ai-mid { background:#5a4a1e; color:#f0dca0; }
-  .ai-bad { background:#5a1e1e; color:#f0b6b6; }
-  .ai-panel { margin-top:6px; padding:8px 10px; background:#0f1115;
-          border:1px solid #2c333f; border-radius:8px; font-size:12px;
-          color:#cbd3df; line-height:1.5; }
-  .ai-panel ul { margin:4px 0; padding-left:18px; color:#f0b6a0; }
-  .ai-panel .ai-meta { color:#8a93a2; margin-top:4px; }
-  .controls { margin:6px 0 2px; display:flex; flex-wrap:wrap; gap:8px;
-          align-items:center; font-size:13px; color:#8a93a2; }
-  .controls select, .controls input { background:#0f1115; color:#e6e6e6;
-          border:1px solid #2c333f; border-radius:6px; padding:5px 7px; font-size:13px; }
-  .controls input.px { width:72px; }
-  .controls .apply { background:#2f5fd0; color:#fff; border-color:#2f5fd0;
-          cursor:pointer; }
-  form.mark-all { display:flex; justify-content:flex-end; margin:2px 16px 0; }
-  form.mark-all button { font-size:13px; }
-  .card.deal { border-color:#2f7d4f; background:#132018; }
-  .olx { color:inherit; text-decoration:none; }
-  .imglink { flex:none; display:block; line-height:0; }
-  .card.has-ai { cursor:pointer; }
-  .card.has-ai:active { background:#1c2230; }
-  .thumb { width:84px; height:84px; border-radius:8px; object-fit:cover;
-           background:#20252e; flex:none; }
-  .body { min-width:0; flex:1; }
-  .title { font-size:14px; line-height:1.25; margin:0 0 4px;
-           display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
-           overflow:hidden; }
-  .title a { color:#e6e6e6; text-decoration:none; }
-  .price { font-size:17px; font-weight:700; }
-  .orig { color:#8a93a2; font-size:12px; font-weight:400; }
-  .meta { color:#8a93a2; font-size:12px; margin-top:3px; }
-  .badge { display:inline-block; font-size:11px; padding:2px 7px; border-radius:20px;
-           margin-right:6px; }
-  .b-deal { background:#1e5f3c; color:#c9f5d9; }
-  .b-dealer { background:#3a2f16; color:#f0dca0; }
-  .b-drop { background:#3a1f16; color:#f0b6a0; }
-  .b-susp { background:#3a2a3a; color:#e0b6f0; }
-  .spark { display:block; margin-top:5px; }
-  .chart { margin:6px 16px 14px; padding:10px 6px; background:#161a20;
-           border:1px solid #262c36; border-radius:12px; }
-  .candles { width:100%; height:auto; display:block; }
-  .was { color:#8a93a2; font-size:12px; text-decoration:line-through; }
-  .drop-pct { color:#f0b6a0; font-size:12px; font-weight:600; }
-  .empty { padding:40px 16px; text-align:center; color:#8a93a2; }
-  form.mng { margin:12px 16px; padding:14px; background:#161a20;
-             border:1px solid #262c36; border-radius:12px; }
-  form.mng label { display:block; font-size:12px; color:#8a93a2; margin:8px 0 3px; }
-  form.mng input, form.mng select { width:100%; padding:9px; font-size:15px;
-        background:#0f1115; color:#e6e6e6; border:1px solid #2c333f; border-radius:8px; }
-  .row2 { display:flex; gap:10px; }
-  .row2 > div { flex:1; }
-  .srow { display:flex; align-items:center; gap:10px; margin:8px 16px; padding:10px;
-          background:#161a20; border:1px solid #262c36; border-radius:10px; }
-  .srow .info { flex:1; min-width:0; }
-  .srow .k { font-weight:600; }
-  .srow .d { color:#8a93a2; font-size:12px; }
-  .srow.paused { opacity:0.6; }
-  .note { color:#8a93a2; font-size:12px; margin:6px 16px; }
-  .flash { margin:10px 16px; padding:10px; border-radius:8px; background:#16321f;
-           color:#c9f5d9; border:1px solid #1e5f3c; font-size:13px; }
-  .flash.warn { background:#3a1f1f; color:#f0b6b6; border-color:#5a2a2a; }
-  .flash code { background:#00000033; padding:1px 5px; border-radius:4px; }
-  .login-wrap { min-height:100vh; display:flex; align-items:center;
-          justify-content:center; padding:16px; }
-  form.login { width:100%; max-width:340px; background:#161a20;
-          border:1px solid #262c36; border-radius:12px; padding:20px; }
-  form.login h1 { margin:0 0 4px; font-size:18px; }
-  form.login label { display:block; font-size:12px; color:#8a93a2; margin:12px 0 3px; }
-  form.login input { width:100%; padding:9px; font-size:15px; background:#0f1115;
-          color:#e6e6e6; border:1px solid #2c333f; border-radius:8px; }
-  form.login button { width:100%; margin-top:16px; padding:10px; font-size:15px;
-          background:#2f5fd0; color:#fff; border:none; border-radius:8px; cursor:pointer; }
+
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg-canvas: #edf2f7;
+    --bg-header: rgba(255, 255, 255, 0.96);
+    --bg-surface: #ffffff;
+    --bg-surface-elevated: #f8fafc;
+    --bg-surface-hover: #f1f5f9;
+    --border-subtle: #cbd5e1;
+    --border-medium: #94a3b8;
+    --border-focus: #2563eb;
+
+    --bg-card-unread: #ffffff;
+    --bg-card-read: #dbe4ee;
+    --border-card-unread: #cbd5e1;
+    --border-card-read: #bcc7d5;
+
+    --text-primary: #020617;
+    --text-secondary: #1e293b;
+    --text-tertiary: #475569;
+
+    --accent-brand: #2563eb;
+    --accent-brand-bg: #eff6ff;
+    --accent-deal: #047857;
+    --accent-deal-bg: #ecfdf5;
+    --accent-deal-border: #34d399;
+    --accent-drop: #b45309;
+    --accent-drop-bg: #fffbeb;
+    --accent-new: #0369a1;
+    --accent-new-bg: #f0f9ff;
+    --accent-fav: #b45309;
+    --accent-susp: #7e22ce;
+    --accent-susp-bg: #faf5ff;
+    --accent-danger: #be123c;
+    --accent-danger-bg: #fff1f2;
+
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+    --shadow-float: 0 10px 25px -3px rgba(0, 0, 0, 0.12), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-canvas);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
+    min-height: 100vh;
+  }
+
+  .wrap { max-width: 1240px; margin: 0 auto; width: 100%; padding: 0 16px; }
+
+  /* --- Frosted Sticky Header --- */
+  header {
+    background: var(--bg-header);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    padding: 10px 0;
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    text-decoration: none;
+    color: var(--text-primary);
+  }
+  .brand-logo {
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 10px rgba(59, 130, 246, 0.35);
+  }
+  .brand-logo svg { width: 18px; height: 18px; color: #fff; }
+  .brand-text {
+    font-family: var(--font-heading);
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+  }
+  .brand-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-deal-bg);
+    color: var(--accent-deal);
+    border: 1px solid var(--accent-deal-border);
+    margin-left: 2px;
+  }
+  .actions { display: flex; align-items: center; gap: 8px; }
+  .iconbtn {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    width: 38px;
+    height: 38px;
+    border-radius: var(--radius-md);
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+    padding: 0;
+  }
+  .iconbtn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+    border-color: var(--border-medium);
+  }
+  .iconbtn:active { transform: scale(0.95); }
+  .iconbtn.spin svg { animation: spin 0.9s linear infinite; }
+  @keyframes spin { 100% { transform: rotate(360deg); } }
+
+  /* --- Live Sync Progress Bar --- */
+  #sync-live-bar {
+    display: none;
+    position: relative;
+    background: var(--bg-surface-elevated);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 8px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    z-index: 19;
+  }
+  #sync-live-bar.active {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    animation: fadeIn 0.2s ease;
+  }
+  .sync-progress-track {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: rgba(59, 130, 246, 0.18);
+  }
+  .sync-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #3b82f6, #10b981);
+    transition: width 0.35s ease;
+  }
+  .sync-live-text {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .sync-live-text svg {
+    animation: spin 0.9s linear infinite;
+    color: var(--accent-brand);
+    flex-shrink: 0;
+  }
+  .sync-live-stats {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sub-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 8px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .chip-deal {
+    background: var(--accent-deal-bg);
+    border-color: var(--accent-deal-border);
+    color: var(--accent-deal);
+    font-weight: 600;
+  }
+  .pulse-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-deal);
+    box-shadow: 0 0 8px var(--accent-deal);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+
+  /* --- Buttons & Inputs --- */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 14px;
+    border-radius: var(--radius-md);
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    background: var(--bg-surface-elevated);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn:hover { background: var(--bg-surface-hover); border-color: var(--border-medium); }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary {
+    background: linear-gradient(135deg, #3b82f6, #4f46e5);
+    color: #fff;
+    border: none;
+    box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+  }
+  .btn-primary:hover { background: linear-gradient(135deg, #2563eb, #4338ca); }
+  .btn-go {
+    background: var(--accent-deal-bg);
+    color: var(--accent-deal);
+    border: 1px solid var(--accent-deal-border);
+  }
+  .btn-go:hover { background: rgba(16, 185, 129, 0.22); }
+  .btn-del {
+    background: var(--accent-danger-bg);
+    color: var(--accent-danger);
+    border: 1px solid rgba(244, 63, 94, 0.3);
+  }
+  .btn-del:hover { background: rgba(244, 63, 94, 0.25); }
+
+  /* --- Horizontal Pill Navigation Bar --- */
+  .pills-nav {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 0 4px;
+  }
+  .pills-nav::-webkit-scrollbar { display: none; }
+  .pill-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: var(--radius-pill);
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    color: var(--text-secondary);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    white-space: nowrap;
+    transition: all 0.15s ease;
+  }
+  .pill-link:hover {
+    color: var(--text-primary);
+    background: var(--bg-surface-elevated);
+    border-color: var(--border-medium);
+  }
+  .pill-link.active {
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 2px 10px rgba(59, 130, 246, 0.35);
+  }
+  .pill-link .badge-num {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: var(--radius-pill);
+    background: rgba(0, 0, 0, 0.25);
+  }
+  .pill-link.active .badge-num { background: rgba(255, 255, 255, 0.25); }
+
+  /* --- Accordion Menu for Full Search Taxonomy --- */
+  .menu {
+    margin: 8px 0;
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+  .menu > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 10px 14px;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    user-select: none;
+  }
+  .menu > summary::-webkit-details-marker { display: none; }
+  .menu > summary .caret {
+    margin-left: auto;
+    color: var(--text-tertiary);
+    transition: transform 0.2s ease;
+  }
+  .menu[open] > summary .caret { transform: rotate(180deg); }
+  .menu .items {
+    border-top: 1px solid var(--border-subtle);
+    max-height: 380px;
+    overflow-y: auto;
+  }
+  .menu .items a {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 9px 14px;
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    transition: background 0.12s;
+  }
+  .menu .items a:hover { background: var(--bg-surface-elevated); color: var(--text-primary); }
+  .menu .items a.on {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    font-weight: 600;
+  }
+  .menu .grp { border-bottom: 1px solid var(--border-subtle); }
+  .menu .grp > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .menu .grp > summary::-webkit-details-marker { display: none; }
+  .menu .grp-name { color: var(--text-primary); text-decoration: none; flex: 1; }
+  .menu .grp-name.on { color: #60a5fa; }
+  .menu .grp-caret { font-size: 10px; color: var(--text-tertiary); transition: transform 0.15s; }
+  .menu .grp[open] > summary .grp-caret { transform: rotate(90deg); }
+  .menu .grp-items a { padding-left: 28px; background: rgba(0, 0, 0, 0.2); }
+
+  /* --- Quick Client Search & Filter Bar --- */
+  .toolbar {
+    margin: 8px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .quick-search-box {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .quick-search-box svg {
+    position: absolute;
+    left: 12px;
+    width: 16px;
+    height: 16px;
+    color: var(--text-tertiary);
+    pointer-events: none;
+  }
+  .quick-search-input {
+    width: 100%;
+    padding: 9px 12px 9px 36px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    transition: all 0.15s ease;
+  }
+  .quick-search-input:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+    background: var(--bg-surface-elevated);
+  }
+
+  .filter-panel {
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+  .filter-panel > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+  }
+  .filter-panel > summary::-webkit-details-marker { display: none; }
+  .filter-panel > summary .badge-filter {
+    font-size: 10px;
+    background: var(--accent-brand-bg);
+    color: #60a5fa;
+    padding: 1px 6px;
+    border-radius: var(--radius-pill);
+  }
+  .filter-form {
+    padding: 12px 14px;
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+  .filter-group { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+  .filter-form select, .filter-form input.px {
+    background: var(--bg-surface-elevated);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 6px 9px;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .filter-form select:focus, .filter-form input.px:focus {
+    outline: none;
+    border-color: #3b82f6;
+  }
+  .filter-form input.px { width: 78px; }
+  .toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  /* --- Card Grid Layout --- */
+  .cards {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  @media (min-width: 760px) {
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 14px;
+    }
+  }
+
+  /* --- Refined Listing Card --- */
+  .card {
+    position: relative;
+    display: flex;
+    gap: 12px;
+    padding: 12px;
+    background: var(--bg-card-unread);
+    border: 1px solid var(--border-card-unread);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+    user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: pan-y;
+  }
+  .card:hover {
+    border-color: var(--border-medium);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.18);
+  }
+  .card.deal {
+    border-color: var(--accent-deal-border);
+    background: linear-gradient(180deg, var(--accent-deal-bg) 0%, var(--bg-card-unread) 100%);
+  }
+  .card.deal.seen {
+    border-color: var(--border-card-read);
+    background: linear-gradient(180deg, var(--accent-deal-bg) 0%, var(--bg-card-read) 100%);
+  }
+  .card.seen {
+    background: var(--bg-card-read);
+    border-color: var(--border-card-read);
+    box-shadow: none;
+  }
+  .card.seen .title a {
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+  .card.seen .thumb-wrap {
+    border-color: var(--border-card-read);
+  }
+  .card.seen .thumb {
+    opacity: 0.92;
+  }
+  .card.sw-fav { box-shadow: inset 8px 0 0 0 var(--accent-fav), var(--shadow-card); }
+  .card.sw-seen { box-shadow: inset -8px 0 0 0 var(--accent-brand), var(--shadow-card); }
+
+  /* Absolute card action buttons */
+  .fav-btn, .hide-btn {
+    position: absolute;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--bg-surface-elevated);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 3;
+    transition: all 0.15s ease;
+  }
+  .fav-btn { top: 8px; left: 8px; font-size: 15px; }
+  .fav-btn.on { color: var(--accent-fav); border-color: rgba(251, 191, 36, 0.5); background: rgba(251, 191, 36, 0.15); }
+  .hide-btn { top: 8px; right: 8px; font-size: 13px; }
+  .hide-btn:hover { background: var(--accent-danger-bg); color: var(--accent-danger); border-color: var(--accent-danger); }
+
+  /* Card Image / Thumbnail */
+  .imglink { flex: none; display: block; }
+  .thumb-wrap {
+    position: relative;
+    width: 92px;
+    height: 92px;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+  .thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.25s ease;
+  }
+  .card:hover .thumb { transform: scale(1.04); }
+  .thumb-placeholder {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-tertiary);
+  }
+
+  /* Card Body */
+  .body { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+  .title {
+    font-size: 13.5px;
+    font-weight: 600;
+    line-height: 1.35;
+    margin-bottom: 4px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .title a {
+    color: var(--text-primary);
+    text-decoration: none;
+    transition: color 0.12s;
+  }
+  .title a:hover { color: #60a5fa; }
+
+  .price-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 5px;
+  }
+  .price {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--text-primary);
+  }
+  .orig {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    font-family: var(--font-sans);
+  }
+
+  /* Badges */
+  .badges-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 5px;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    letter-spacing: 0.1px;
+  }
+  .b-deal {
+    background: var(--accent-deal-bg);
+    color: var(--accent-deal);
+    border: 1px solid var(--accent-deal-border);
+  }
+  .b-new {
+    background: var(--accent-new-bg);
+    color: var(--accent-new);
+    border: 1px solid rgba(6, 182, 212, 0.45);
+  }
+  .b-drop {
+    background: var(--accent-drop-bg);
+    color: var(--accent-drop);
+    border: 1px solid rgba(245, 158, 11, 0.45);
+  }
+  .b-dealer {
+    background: var(--bg-surface-elevated);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-subtle);
+  }
+  .b-susp {
+    background: var(--accent-susp-bg);
+    color: var(--accent-susp);
+    border: 1px solid rgba(192, 132, 252, 0.45);
+  }
+  .ai-badge { cursor: pointer; }
+  .ai-good { background: var(--accent-deal-bg); color: var(--accent-deal); border: 1px solid var(--accent-deal-border); }
+  .ai-mid { background: var(--accent-drop-bg); color: var(--accent-drop); border: 1px solid rgba(245, 158, 11, 0.45); }
+  .ai-bad { background: var(--accent-danger-bg); color: var(--accent-danger); border: 1px solid rgba(244, 63, 94, 0.45); }
+
+  /* Metadata & Location */
+  .meta-row {
+    font-size: 11.5px;
+    color: var(--text-tertiary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .meta-row svg { width: 12px; height: 12px; vertical-align: -1px; }
+
+  /* Price Sparkline */
+  .spark-wrap { margin-top: 4px; }
+  .was-row {
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 2px;
+  }
+  .was { text-decoration: line-through; color: var(--text-tertiary); font-family: var(--font-mono); }
+  .drop-pct { color: var(--accent-drop); font-weight: 700; font-family: var(--font-mono); }
+  .spark { display: block; overflow: visible; }
+
+  /* Action Buttons on Card Bottom */
+  .card-footer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .seen-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 3px 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .seen-btn:hover { color: var(--text-primary); border-color: var(--border-medium); }
+  .seen-btn.on { color: var(--accent-deal); background: var(--accent-deal-bg); border-color: var(--accent-deal-border); }
+  .ai-action-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: #c084fc;
+    background: var(--accent-susp-bg);
+    border: 1px solid rgba(192, 132, 252, 0.3);
+    border-radius: var(--radius-sm);
+    padding: 3px 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .ai-action-btn:hover { background: rgba(192, 132, 252, 0.22); }
+
+  /* AI Panel */
+  .ai-panel {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: rgba(10, 14, 22, 0.9);
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    line-height: 1.5;
+    color: #cbd5e1;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  }
+  .ai-panel ul { margin: 6px 0 6px 18px; color: #fca5a5; }
+  .ai-meta { color: var(--text-tertiary); font-size: 11px; margin-top: 6px; }
+
+  /* --- Candlestick & Trends View --- */
+  .chart-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 14px;
+    margin: 10px 0 16px;
+    box-shadow: var(--shadow-card);
+  }
+  .chart-title {
+    font-family: var(--font-heading);
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .candles { width: 100%; height: auto; display: block; }
+
+  /* --- Management View & Forms --- */
+  .mng-box {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    margin: 12px 0;
+    box-shadow: var(--shadow-card);
+  }
+  .mng-box h2 {
+    font-family: var(--font-heading);
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+  }
+  .form-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 10px 0 4px;
+  }
+  .form-input, .form-select {
+    width: 100%;
+    padding: 9px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--bg-surface-elevated);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    transition: border-color 0.15s;
+  }
+  .form-input:focus, .form-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+  }
+  .row2 { display: flex; gap: 10px; }
+  .row2 > div { flex: 1; }
+
+  .srow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    margin-bottom: 8px;
+    transition: border-color 0.15s;
+  }
+  .srow:hover { border-color: var(--border-medium); }
+  .srow .info { flex: 1; min-width: 0; }
+  .srow .k { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  .srow .d { color: var(--text-tertiary); font-size: 12px; margin-top: 2px; }
+  .srow.paused { opacity: 0.6; }
+
+  /* Discovery Chips */
+  .chip-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 9px;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    margin: 3px 4px 3px 0;
+    transition: transform 0.12s, box-shadow 0.12s;
+  }
+  .chip-pill:hover { transform: scale(1.04); }
+  .chip-pill:active { transform: scale(0.96); }
+
+  /* --- Floating Glass Tabbar --- */
+  .tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    background: var(--bg-header);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid var(--border-subtle);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .tabbar .wrap { display: flex; padding: 0 8px; }
+  .tabbar a {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 8px 4px 7px;
+    color: var(--text-tertiary);
+    text-decoration: none;
+    font-size: 10.5px;
+    font-weight: 600;
+    transition: all 0.15s ease;
+  }
+  .tabbar a svg { width: 20px; height: 20px; stroke-width: 2.1; transition: transform 0.15s; }
+  .tabbar a:hover { color: var(--text-secondary); }
+  .tabbar a.active { color: #60a5fa; }
+  .tabbar a.active svg { transform: translateY(-1px); color: #3b82f6; }
+
+  /* --- Flash Messages & Toast System --- */
+  .flash {
+    margin: 10px 0;
+    padding: 10px 14px;
+    border-radius: var(--radius-md);
+    background: rgba(16, 185, 129, 0.12);
+    color: #6ee7b7;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    font-size: 13px;
+  }
+  .flash.warn {
+    background: rgba(244, 63, 94, 0.12);
+    color: #fda4af;
+    border-color: rgba(244, 63, 94, 0.3);
+  }
+
+  #toast-box {
+    position: fixed;
+    bottom: calc(76px + env(safe-area-inset-bottom));
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 100;
+    pointer-events: none;
+    width: 90%;
+    max-width: 380px;
+  }
+  .toast {
+    padding: 10px 16px;
+    border-radius: var(--radius-pill);
+    background: rgba(18, 24, 38, 0.95);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border-medium);
+    box-shadow: var(--shadow-float);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    animation: toastIn 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+    transition: opacity 0.2s, transform 0.2s;
+  }
+  .toast.toast-success { border-color: var(--accent-deal); color: #6ee7b7; }
+  .toast.toast-warn { border-color: var(--accent-drop); color: #fde68a; }
+  @keyframes toastIn {
+    from { opacity: 0; transform: translateY(16px) scale(0.95); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  /* Empty State */
+  .empty {
+    padding: 48px 16px;
+    text-align: center;
+    color: var(--text-tertiary);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  /* Login page */
+  .login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  form.login {
+    width: 100%;
+    max-width: 360px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+    box-shadow: var(--shadow-float);
+  }
+  form.login h1 {
+    font-family: var(--font-heading);
+    font-size: 22px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
 """
 
 _LOGIN_PAGE = """<!doctype html>
 <html lang="ro"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>OLX Deals — sign in</title>
+<title>OLX Deals — Sign In</title>
+<script>
+(function() {{
+  try {{
+    var t = localStorage.getItem('olx_theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', t);
+  }} catch(e) {{}}
+}})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{css}</style></head><body>
 <div class="login-wrap">
 <form class="login" method="post" action="/login">
-  <h1>OLX Deals</h1>
+  <h1><div class="brand-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></svg></div> OLX Deals</h1>
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Sign in to access your deal tracker.</p>
   {error}
   <input type="hidden" name="next" value="{next}">
-  <label>Username</label>
-  <input name="user" autocomplete="username" autofocus required>
-  <label>Password</label>
-  <input name="pass" type="password" autocomplete="current-password" required>
-  <button type="submit">Sign in</button>
+  <label class="form-label">Username</label>
+  <input class="form-input" name="user" autocomplete="username" autofocus required>
+  <label class="form-label">Password</label>
+  <input class="form-input" name="pass" type="password" autocomplete="current-password" required>
+  <button class="btn btn-primary" type="submit" style="width:100%;margin-top:16px;padding:10px">Sign in</button>
 </form>
 </div>
 </body></html>"""
@@ -307,47 +1193,238 @@ def render_login(error: str, next_path: str) -> str:
     return _LOGIN_PAGE.format(
         css=_CSS, error=error_html, next=html.escape(next_path or "/"))
 
+
 _SHELL = """<!doctype html>
 <html lang="ro"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OLX Deals</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#0f1115">
+<meta name="theme-color" content="#090c10">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="OLX Deals">
 <link rel="apple-touch-icon" href="/static/icon-180.png">
 <link rel="icon" type="image/png" href="/static/icon-192.png">
+<script>
+(function() {{
+  try {{
+    var t = localStorage.getItem('olx_theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', t);
+  }} catch(e) {{}}
+}})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>{css}</style></head><body>
 <header>
   <div class="wrap">
     <div class="topbar">
-      <h1>OLX Deals</h1>
+      <a class="brand" href="/">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </div>
+        <span class="brand-text">OLX Deals</span>
+      </a>
       <div class="actions">
-        <form method="post" action="/sync">
-          <button class="iconbtn" type="submit" title="Sync now">&#8635;</button>
+        <button class="iconbtn" id="theme-btn" type="button" onclick="toggleTheme()" title="Toggle light/dark mode">
+          <svg id="theme-ic-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg id="theme-ic-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <form method="post" action="/sync" onsubmit="handleSync(event, this)">
+          <button class="iconbtn" id="sync-btn" type="submit" title="Sync now">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/></svg>
+          </button>
         </form>
-        <button class="iconbtn" type="button" onclick="enableNotifs()"
-                title="Enable deal alerts">&#128276;</button>
+        <button class="iconbtn" type="button" onclick="enableNotifs()" title="Enable deal alerts">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        </button>
       </div>
     </div>
-    <div class="sub">{sub}</div>
+    <div class="sub-chips">{sub_chips}</div>
   </div>
 </header>
-{flash}
+
+<div id="sync-live-bar">
+  <div class="sync-live-text">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/></svg>
+    <span id="sync-status-msg">Starting sync...</span>
+  </div>
+  <div class="sync-live-stats" id="sync-stats-msg">0/0</div>
+  <div class="sync-progress-track">
+    <div class="sync-progress-fill" id="sync-progress-fill"></div>
+  </div>
+</div>
+
+<div class="wrap">
+  {flash}
+</div>
+
 <main class="wrap">
 {content}
 </main>
+
+<div id="toast-box"></div>
+
 <nav class="tabbar"><div class="wrap">
-  <a href="{deals_href}" class="{deals_active}"><span class="ic">&#127991;</span>Deals</a>
-  <a href="{drops_href}" class="{drops_active}"><span class="ic">&#128201;</span>Drops</a>
-  <a href="/saved" class="{saved_active}"><span class="ic">&#9733;</span>Saved</a>
-  <a href="{trends_href}" class="{trends_active}"><span class="ic">&#128202;</span>Trends</a>
-  <a href="/searches" class="{manage_active}"><span class="ic">&#9881;</span>Manage</a>
+  <a href="{deals_href}" class="{deals_active}">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+    Deals
+  </a>
+  <a href="{drops_href}" class="{drops_active}">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/><polyline points="17 18 23 18 23 12"/></svg>
+    Drops
+  </a>
+  <a href="/saved" class="{saved_active}">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+    Saved
+  </a>
+  <a href="{trends_href}" class="{trends_active}">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+    Trends
+  </a>
+  <a href="/searches" class="{manage_active}">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    Manage
+  </a>
 </div></nav>
+
 <script>
+// --- Non-blocking Toast system ---
+function showToast(msg, type) {{
+  var box = document.getElementById('toast-box');
+  if (!box) return;
+  var el = document.createElement('div');
+  el.className = 'toast ' + (type === 'success' ? 'toast-success' : type === 'warn' ? 'toast-warn' : '');
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(function() {{
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(10px) scale(0.95)';
+    setTimeout(function() {{ el.remove(); }}, 200);
+  }}, 2800);
+}}
+
+// --- Live Sync Stream & Auto-Reload ---
+var syncEvtSource = null;
+var wasSyncRunning = false;
+
+function initSyncStream() {{
+  if (!!window.EventSource) {{
+    syncEvtSource = new EventSource('/api/sync/events');
+    syncEvtSource.onmessage = function(e) {{
+      try {{
+        var data = JSON.parse(e.data);
+        handleSyncUpdate(data);
+      }} catch(err) {{}}
+    }};
+    syncEvtSource.onerror = function() {{
+      setTimeout(pollSyncStatus, 2500);
+    }};
+  }} else {{
+    pollSyncStatus();
+  }}
+}}
+
+function pollSyncStatus() {{
+  fetch('/api/sync/status')
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      handleSyncUpdate(data);
+      if (data.running) setTimeout(pollSyncStatus, 1500);
+    }})
+    .catch(function() {{}});
+}}
+
+function handleSyncUpdate(data) {{
+  var bar = document.getElementById('sync-live-bar');
+  var msgEl = document.getElementById('sync-status-msg');
+  var statsEl = document.getElementById('sync-stats-msg');
+  var fillEl = document.getElementById('sync-progress-fill');
+  var syncBtn = document.getElementById('sync-btn');
+
+  if (!bar) return;
+
+  if (data.running) {{
+    wasSyncRunning = true;
+    bar.classList.add('active');
+    if (syncBtn) syncBtn.classList.add('spin');
+    if (msgEl) msgEl.textContent = data.message || 'Syncing in background...';
+    var pct = data.total > 0 ? Math.round((data.step / data.total) * 100) : 10;
+    if (fillEl) fillEl.style.width = Math.min(100, Math.max(6, pct)) + '%';
+    if (statsEl) {{
+      var dealTxt = data.deal_count > 0 ? (' · ' + data.deal_count + ' deal' + (data.deal_count > 1 ? 's' : '')) : '';
+      statsEl.textContent = (data.step || 0) + '/' + (data.total || 0) + dealTxt;
+    }}
+  }} else {{
+    if (syncBtn) syncBtn.classList.remove('spin');
+    if (wasSyncRunning) {{
+      wasSyncRunning = false;
+      if (fillEl) fillEl.style.width = '100%';
+      if (msgEl) msgEl.textContent = 'Sync finished!';
+      setTimeout(function() {{
+        bar.classList.remove('active');
+      }}, 1400);
+
+      var newCount = data.new_count || 0;
+      var dealCount = data.deal_count || 0;
+      var toastMsg = 'Sync complete! ' + (newCount > 0 ? (newCount + ' new item' + (newCount > 1 ? 's' : '') + (dealCount > 0 ? ', ' + dealCount + ' deal(s)' : '')) : 'No new listings');
+      showToast(toastMsg, 'success');
+      refreshPageContent();
+    }} else {{
+      bar.classList.remove('active');
+    }}
+  }}
+}}
+
+function refreshPageContent() {{
+  fetch(window.location.href, {{ headers: {{'X-Requested-With': 'XMLHttpRequest'}} }})
+    .then(function(r) {{ return r.text(); }})
+    .then(function(html) {{
+      var parser = new DOMParser();
+      var doc = parser.parseFromString(html, 'text/html');
+
+      var newMain = doc.querySelector('main.wrap');
+      var curMain = document.querySelector('main.wrap');
+      if (newMain && curMain) {{
+        curMain.innerHTML = newMain.innerHTML;
+      }}
+
+      var newChips = doc.querySelector('.sub-chips');
+      var curChips = document.querySelector('.sub-chips');
+      if (newChips && curChips) {{
+        curChips.innerHTML = newChips.innerHTML;
+      }}
+
+      var searchInput = document.getElementById('client-search-input');
+      if (searchInput && searchInput.value) {{
+        filterCards(searchInput.value);
+      }}
+    }})
+    .catch(function() {{}});
+}}
+
+function handleSync(e, form) {{
+  e.preventDefault();
+  var btn = document.getElementById('sync-btn');
+  if (btn) btn.classList.add('spin');
+  var bar = document.getElementById('sync-live-bar');
+  if (bar) bar.classList.add('active');
+  var msgEl = document.getElementById('sync-status-msg');
+  if (msgEl) msgEl.textContent = 'Starting background sync...';
+
+  fetch('/sync', {{
+    method: 'POST',
+    headers: {{'Accept': 'application/json'}}
+  }}).then(function() {{
+    pollSyncStatus();
+  }}).catch(function() {{}});
+}}
+
+initSyncStream();
+
 // On Android, rewrite listing links to open the OLX app (ro.mercador),
 // falling back to the web page if the app isn't installed.
 if (/Android/i.test(navigator.userAgent)) {{
@@ -368,23 +1445,30 @@ function excludeId(id, el) {{
     body: 'id=' + encodeURIComponent(id),
     cache: 'no-store'
   }}).then(function(r) {{
-    if (r.ok) {{ if (el) el.remove(); }}
-    else {{ alert('Could not hide (server returned ' + r.status + ').'); }}
+    if (r.ok) {{
+      if (el) {{
+        el.style.transition = 'all 0.25s ease';
+        el.style.opacity = '0';
+        el.style.transform = 'scale(0.9)';
+        setTimeout(function() {{ el.remove(); }}, 250);
+      }}
+      showToast('Listing hidden from tracking', 'warn');
+    }}
+    else {{ showToast('Could not hide (error ' + r.status + ')', 'warn'); }}
   }}).catch(function(err) {{
-    alert('Could not hide — request failed: ' + err +
-          '\\nIf this keeps happening, close and reopen the app to refresh it.');
+    showToast('Failed to hide: ' + err, 'warn');
   }});
 }}
 function askHide(card) {{
   if (!card) return;
-  if (confirm('Hide this listing from tracking?\\nIt stays hidden on future ' +
-              'syncs — restore it from the Manage tab.'))
+  if (confirm('Hide this listing from tracking?\\nIt stays hidden on future syncs — restore it from Manage.'))
     excludeId(card.dataset.id, card);
 }}
 function hideCard(e, btn) {{
   e.preventDefault(); e.stopPropagation();
   askHide(btn.closest('.card'));
 }}
+
 // Toggle a per-listing flag (favorite / seen) without navigating.
 function toggleFlag(e, btn, path, cls, onOk) {{
   e.preventDefault(); e.stopPropagation();
@@ -402,12 +1486,33 @@ function toggleFlag(e, btn, path, cls, onOk) {{
 }}
 function toggleFav(e, btn) {{
   toggleFlag(e, btn, '/favorite', null,
-    function(on) {{ btn.textContent = on ? '\\u2605' : '\\u2606'; }});
+    function(on) {{
+      btn.textContent = on ? '★' : '☆';
+      showToast(on ? 'Saved to Favorites' : 'Removed from Favorites', 'success');
+    }});
 }}
 function toggleSeen(e, btn) {{
   toggleFlag(e, btn, '/seen', 'seen',
-    function(on) {{ btn.textContent = on ? 'seen \\u2713' : 'mark seen'; }});
+    function(on) {{
+      btn.textContent = on ? 'seen ✓' : 'mark seen';
+      showToast(on ? 'Marked as seen' : 'Marked as unread');
+    }});
 }}
+
+// Fast client-side quick filter
+function filterCards(q) {{
+  var term = (q || '').toLowerCase().trim();
+  var count = 0;
+  document.querySelectorAll('.card[data-id]').forEach(function(c) {{
+    var text = (c.innerText || '').toLowerCase();
+    var match = !term || text.indexOf(term) !== -1;
+    c.style.display = match ? '' : 'none';
+    if (match) count++;
+  }});
+  var counter = document.getElementById('visible-count');
+  if (counter) counter.textContent = count + ' visible';
+}}
+
 // LLM verdict: toggle the detail panel / run an on-demand analysis.
 function toggleAi(e, el) {{
   e.preventDefault(); e.stopPropagation();
@@ -418,8 +1523,9 @@ function runAnalyze(e, btn) {{
   e.preventDefault(); e.stopPropagation();
   if (btn.dataset.busy) return;
   btn.dataset.busy = '1';
-  btn.textContent = 'analyzing\\u2026';
+  btn.textContent = 'analyzing…';
   var card = btn.closest('.card');
+  showToast('Running AI inspection...', 'info');
   fetch('/analyze', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
@@ -428,15 +1534,16 @@ function runAnalyze(e, btn) {{
     if (r.ok) {{ location.reload(); }}
     else {{
       r.text().then(function(t) {{
-        alert('Analysis failed: ' + (t || r.status));
-        delete btn.dataset.busy; btn.textContent = '\\u2726 analyze';
+        showToast('Analysis failed: ' + (t || r.status), 'warn');
+        delete btn.dataset.busy; btn.textContent = '✦ analyze';
       }});
     }}
   }}).catch(function(err) {{
-    alert('Analysis failed: ' + err);
-    delete btn.dataset.busy; btn.textContent = '\\u2726 analyze';
+    showToast('Analysis failed: ' + err, 'warn');
+    delete btn.dataset.busy; btn.textContent = '✦ analyze';
   }});
 }}
+
 // Set a per-listing flag on the server and reflect it in the card UI.
 function setFlag(card, path, on) {{
   fetch(path, {{
@@ -451,24 +1558,25 @@ function swipeSeen(card) {{  // swipe left -> toggle "seen"
   setFlag(card, '/seen', on);
   card.classList.toggle('seen', on);
   if (btn) {{ btn.classList.toggle('on', on);
-    btn.textContent = on ? 'seen \\u2713' : 'mark seen'; }}
+    btn.textContent = on ? 'seen ✓' : 'mark seen'; }}
+  showToast(on ? 'Marked seen' : 'Marked unread');
 }}
 function swipeFav(card) {{  // swipe right -> toggle favorite
   var btn = card.querySelector('.fav-btn');
   var on = !(btn && btn.classList.contains('on'));
   setFlag(card, '/favorite', on);
   if (btn) {{ btn.classList.toggle('on', on);
-    btn.textContent = on ? '\\u2605' : '\\u2606'; }}
+    btn.textContent = on ? '★' : '☆'; }}
+  showToast(on ? 'Saved to Favorites' : 'Removed from Favorites', 'success');
 }}
 
-// Per-card gestures: title/image link to OLX; tap the body opens the AI
-// summary; long-press hides; horizontal swipe = seen (left) / favorite (right).
+// Per-card gestures: title/image link to OLX; tap body toggles AI; swipe/long-press.
 document.querySelectorAll('.card[data-id]').forEach(function(card) {{
   var timer = null, fired = false;
   var startX = 0, startY = 0, dx = 0, swiping = false, swiped = false;
 
   function settle() {{
-    card.style.transition = 'transform .18s ease';
+    card.style.transition = 'transform .2s ease';
     card.style.transform = '';
     card.classList.remove('sw-fav', 'sw-seen');
   }}
@@ -478,21 +1586,21 @@ document.querySelectorAll('.card[data-id]').forEach(function(card) {{
     startX = e.touches[0].clientX; startY = e.touches[0].clientY;
     dx = 0; swiping = false; swiped = false; fired = false;
     card.style.transition = '';
-    timer = setTimeout(function() {{ fired = true; askHide(card); }}, 550);
+    timer = setTimeout(function() {{ fired = true; askHide(card); }}, 520);
   }}, {{passive: true}});
 
   card.addEventListener('touchmove', function(e) {{
     var mx = e.touches[0].clientX - startX, my = e.touches[0].clientY - startY;
     if (!swiping) {{
       if (Math.abs(mx) > 12 && Math.abs(mx) > Math.abs(my) * 1.5) {{
-        swiping = true; clearTimeout(timer);   // horizontal -> swipe
+        swiping = true; clearTimeout(timer);
       }} else {{
-        if (Math.abs(my) > 10) clearTimeout(timer);  // vertical -> let it scroll
+        if (Math.abs(my) > 10) clearTimeout(timer);
         return;
       }}
     }}
     dx = mx;
-    e.preventDefault();                          // hold the horizontal drag
+    e.preventDefault();
     card.style.transform = 'translateX(' + dx + 'px)';
     card.classList.toggle('sw-fav', dx > 45);
     card.classList.toggle('sw-seen', dx < -45);
@@ -502,10 +1610,10 @@ document.querySelectorAll('.card[data-id]').forEach(function(card) {{
     card.addEventListener(ev, function() {{
       clearTimeout(timer);
       if (!swiping) return;
-      if (dx <= -80) swipeSeen(card);
-      else if (dx >= 80) swipeFav(card);
+      if (dx <= -75) swipeSeen(card);
+      else if (dx >= 75) swipeFav(card);
       settle();
-      swiped = true; swiping = false;           // suppress the trailing click
+      swiped = true; swiping = false;
     }});
   }});
 
@@ -514,14 +1622,14 @@ document.querySelectorAll('.card[data-id]').forEach(function(card) {{
     if (fired || swiped) {{
       e.preventDefault(); e.stopPropagation(); fired = false; swiped = false; return;
     }}
-    if (e.target.closest('.olx, .fav-btn, .hide-btn, .seen-btn, .ai-badge, .ai-panel'))
+    if (e.target.closest('.olx, .fav-btn, .hide-btn, .seen-btn, .ai-badge, .ai-panel, .ai-action-btn'))
       return;
     var panel = card.querySelector('.ai-panel');
-    if (panel) panel.hidden = !panel.hidden;    // tap body -> toggle AI summary
+    if (panel) panel.hidden = !panel.hidden;
   }});
 }});
 
-// Register the service worker (only in a secure context — HTTPS/localhost).
+// Register service worker
 if ('serviceWorker' in navigator && window.isSecureContext) {{
   navigator.serviceWorker.register('/sw.js').catch(function() {{}});
 }}
@@ -535,15 +1643,14 @@ function urlB64ToUint8(b64) {{
 }}
 async function enableNotifs() {{
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
-    alert('This browser does not support push notifications.'); return;
+    showToast('Push notifications not supported in this browser', 'warn'); return;
   }}
   if (!window.isSecureContext) {{
-    alert('Open the app via its HTTPS address (…ts.net:8443) to enable alerts.');
-    return;
+    showToast('Open via HTTPS address to enable alerts', 'warn'); return;
   }}
   try {{
     var perm = await Notification.requestPermission();
-    if (perm !== 'granted') {{ alert('Notifications were not allowed.'); return; }}
+    if (perm !== 'granted') {{ showToast('Notification permission denied', 'warn'); return; }}
     var reg = await navigator.serviceWorker.ready;
     var key = (await (await fetch('/push/public-key')).json()).key;
     var sub = await reg.pushManager.subscribe({{
@@ -553,12 +1660,41 @@ async function enableNotifs() {{
       method: 'POST', headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify(sub)
     }});
-    await fetch('/push/test', {{method: 'POST'}});  // immediate confirmation push
-    alert('Deal alerts enabled — you should see a test notification.');
+    await fetch('/push/test', {{method: 'POST'}});
+    showToast('Deal alerts enabled! Test notification sent.', 'success');
   }} catch (err) {{
-    alert('Could not enable alerts: ' + err);
+    showToast('Could not enable alerts: ' + err, 'warn');
   }}
 }}
+
+function updateThemeIcons(theme) {{
+  var sun = document.getElementById('theme-ic-sun');
+  var moon = document.getElementById('theme-ic-moon');
+  var metaTheme = document.querySelector('meta[name="theme-color"]');
+  if (theme === 'light') {{
+    if (sun) sun.style.display = 'none';
+    if (moon) moon.style.display = 'block';
+    if (metaTheme) metaTheme.setAttribute('content', '#f4f6f8');
+  }} else {{
+    if (sun) sun.style.display = 'block';
+    if (moon) moon.style.display = 'none';
+    if (metaTheme) metaTheme.setAttribute('content', '#090c10');
+  }}
+}}
+
+function toggleTheme() {{
+  var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  var next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try {{ localStorage.setItem('olx_theme', next); }} catch(e) {{}}
+  updateThemeIcons(next);
+  showToast(next === 'light' ? '☀️ Light mode enabled' : '🌙 Dark mode enabled');
+}}
+
+(function() {{
+  var curTh = document.documentElement.getAttribute('data-theme') || 'dark';
+  updateThemeIcons(curTh);
+}})();
 </script>
 </body></html>"""
 
@@ -624,9 +1760,8 @@ def _sync_banner(store: Store) -> str:
     if not failed:
         return ""
     names = ", ".join(html.escape(k) for k in failed)
-    return (f'<div class="flash warn">&#9888; Last sync failed for {names}. '
-            f'Data may be stale — see <code>journalctl --user -u olx-sync</code>.'
-            f'</div>')
+    return (f'<div class="flash warn">⚠️ Last sync failed for {names}. '
+            f'Data may be stale — check system logs.</div>')
 
 
 def _last_sync_text(store: Store) -> str:
@@ -637,10 +1772,28 @@ def _last_sync_text(store: Store) -> str:
     return f"synced {_time_ago(latest)}"
 
 
-def _shell(sub: str, content: str, active: str, flash: str = "") -> str:
+def _sub_chips_html(scope_txt: str, shown_deals: int, store: Store,
+                    market_chip: str = "") -> str:
+    n24, c24 = store.ai_cost(24)
+    nT, cT = store.ai_cost()
+    ai_chip = f'<span class="chip">✦ AI ${c24:.2f}/24h</span>' if nT else ""
+    deal_chip = (f'<span class="chip chip-deal"><span class="pulse-dot"></span> '
+                 f'{shown_deals} deal(s)</span>' if shown_deals > 0
+                 else '<span class="chip">0 deals</span>')
+    return (
+        f'<span class="chip">🔍 {html.escape(scope_txt)}</span>'
+        f'{deal_chip}'
+        f'<span class="chip">🕒 {_last_sync_text(store)}</span>'
+        f'<span class="chip">💶 1€ = {scorer.EUR_TO_RON:.2f} RON</span>'
+        f'{market_chip}'
+        f'{ai_chip}'
+    )
+
+
+def _shell(sub_chips: str, content: str, active: str, flash: str = "") -> str:
     flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
     return _SHELL.format(
-        css=_CSS, sub=sub, content=content, flash=flash_html,
+        css=_CSS, sub_chips=sub_chips, content=content, flash=flash_html,
         deals_href=_tab_href("/"),
         drops_href=_tab_href("/drops"),
         trends_href=_tab_href("/history"),
@@ -654,7 +1807,7 @@ def _shell(sub: str, content: str, active: str, flash: str = "") -> str:
 
 # ---------- deals page ----------
 
-DISPLAY_CAP = 80  # max cards rendered per Deals view (after sort/filter)
+DISPLAY_CAP = 100  # max cards rendered per Deals view
 
 
 def _ron_series(history: list | None) -> list[float]:
@@ -667,27 +1820,37 @@ def _ron_series(history: list | None) -> list[float]:
     return out
 
 
-def _sparkline(series: list[float], w: int = 130, h: int = 28) -> str:
-    """Tiny inline SVG line chart of a price series (>=2 points)."""
+def _sparkline(series: list[float], w: int = 140, h: int = 28) -> str:
+    """Polished SVG gradient sparkline with smooth polyline."""
     lo, hi = min(series), max(series)
     span = (hi - lo) or 1.0
     n = len(series)
     pts = []
     for i, v in enumerate(series):
         x = 2 + (w - 4) * i / (n - 1)
-        y = 2 + (h - 4) * (1 - (v - lo) / span)
+        y = 3 + (h - 6) * (1 - (v - lo) / span)
         pts.append(f"{x:.1f},{y:.1f}")
     last, first = series[-1], series[0]
-    color = "#5fd08a" if last < first else "#f0b6a0" if last > first else "#8a93a2"
-    return (f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
-            f'<polyline fill="none" stroke="{color}" stroke-width="1.5" '
-            f'points="{" ".join(pts)}"/></svg>')
+    color = "#10b981" if last < first else "#f59e0b" if last > first else "#94a3b8"
+    grad_id = f"spk_{abs(hash(tuple(series))) % 100000}"
+    area_pts = pts[0] + " " + " ".join(pts) + f" {w-2:.1f},{h-1} 2,{h-1}"
+    return (
+        f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+        f'<defs><linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.28"/>'
+        f'<stop offset="100%" stop-color="{color}" stop-opacity="0.0"/>'
+        f'</linearGradient></defs>'
+        f'<polygon fill="url(#{grad_id})" points="{area_pts}"/>'
+        f'<polyline fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" points="{" ".join(pts)}"/>'
+        f'<circle cx="{pts[-1].split(",")[0]}" cy="{pts[-1].split(",")[1]}" r="2.5" fill="{color}"/>'
+        f'</svg>'
+    )
 
 
 def _ai_bits(analysis: dict | None) -> tuple[str, str, str]:
     """(badge_html, panel_html, action_html) for a listing's LLM verdict."""
     if not analysis:
-        return "", "", ('<span class="seen-btn" '
+        return "", "", ('<span class="ai-action-btn" '
                         'onclick="runAnalyze(event,this)">✦ analyze</span>')
     score = analysis.get("score") or 0
     risk = analysis.get("scam_risk") or "?"
@@ -702,15 +1865,15 @@ def _ai_bits(analysis: dict | None) -> tuple[str, str, str]:
                     for f in v.get("red_flags") or [])
     panel = f"""<div class="ai-panel" hidden
      onclick="event.preventDefault();event.stopPropagation()">
-  <div><b>{html.escape(v.get('summary', ''))}</b></div>
+  <div style="font-weight:700;margin-bottom:3px">{html.escape(v.get('summary', ''))}</div>
   <div>Condition: {html.escape(v.get('condition_summary', ''))}</div>
   {'<ul>' + flags + '</ul>' if flags else ''}
-  <div>&#128161; {html.escape(v.get('negotiation_tip', ''))}</div>
-  <div class="ai-meta">scam risk: {html.escape(str(risk))} · photos match:
-    {'yes' if v.get('photos_match_description') else '<b>NO</b>'}</div>
+  <div style="margin-top:4px">💡 {html.escape(v.get('negotiation_tip', ''))}</div>
+  <div class="ai-meta">Scam risk: <b>{html.escape(str(risk).upper())}</b> · Photos match:
+    {'✓ yes' if v.get('photos_match_description') else '<b style="color:#f43f5e">NO</b>'}</div>
 </div>"""
     badge = (f'<span class="badge ai-badge {cls}" '
-             f'onclick="toggleAi(event,this)">AI {score}</span>')
+             f'onclick="toggleAi(event,this)">✦ AI {score}</span>')
     return badge, panel, ""
 
 
@@ -720,48 +1883,49 @@ def _card(sl, history: list | None = None, search_label: str | None = None,
     title = html.escape(r.get("title") or "—")
     url = html.escape(r.get("url") or "#")
     cur = r.get("currency") or ""
-    price_txt = f"{sl.price_ron:.0f} RON" if sl.price_ron is not None else "—"
+    price_val = f"{sl.price_ron:,.0f} RON".replace(",", ".") if sl.price_ron is not None else "—"
     orig = ""
     if cur == "EUR" and r.get("price") is not None:
-        orig = f' <span class="orig">({r["price"]:.0f} EUR)</span>'
+        orig = f'<span class="orig">({r["price"]:.0f} EUR)</span>'
     thumb = html.escape(r.get("photo") or "")
-    img = (f'<img class="thumb" loading="lazy" src="{thumb}">'
-           if thumb else '<div class="thumb"></div>')
+    if thumb:
+        img_html = f'<img class="thumb" loading="lazy" src="{thumb}" alt="{title}">'
+    else:
+        img_html = ('<div class="thumb-placeholder"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div>')
+
     badges = ""
-    # Freshly-appeared listings (first tracked <24h ago) are the best signal.
     if _is_recent(r.get("first_seen"), 24):
-        badges += '<span class="badge b-new">NEW</span>'
+        badges += '<span class="badge b-new">✦ NEW</span>'
     if sl.is_deal:
-        badges += f'<span class="badge b-deal">−{sl.deal_score*100:.0f}% deal</span>'
+        badges += f'<span class="badge b-deal">⚡ −{sl.deal_score*100:.0f}% deal</span>'
     elif sl.suspicious:
-        badges += (f'<span class="badge b-susp">too cheap? −'
-                   f'{sl.deal_score*100:.0f}%</span>')
+        badges += f'<span class="badge b-susp">⚠ too cheap −{sl.deal_score*100:.0f}%</span>'
     if r.get("is_business"):
-        badges += '<span class="badge b-dealer">dealer</span>'
+        badges += '<span class="badge b-dealer">🏢 dealer</span>'
     pp = r.get("previous_price")
     if pp is not None and r.get("price") is not None and pp > r["price"]:
-        badges += '<span class="badge b-drop">price drop</span>'
+        badges += '<span class="badge b-drop">↓ price drop</span>'
 
     meta_bits = []
     if r.get("city"):
-        meta_bits.append(html.escape(r["city"]))
+        meta_bits.append(f'<span>📍 {html.escape(r["city"])}</span>')
     posted = _time_ago(r.get("created_time"))
     if posted and posted != "never":
-        meta_bits.append(f"posted {posted}")
+        meta_bits.append(f'<span>🕒 {posted}</span>')
     if search_label:
-        meta_bits.append(f'<span style="color:#6b7280">{html.escape(search_label)}</span>')
-    city = " · ".join(meta_bits)
+        meta_bits.append(f'<span class="chip" style="font-size:10px;padding:1px 6px">{html.escape(search_label)}</span>')
+    meta_html = "".join(meta_bits)
 
-    # Price history: sparkline + "was X (−Y%)" when the price has fallen.
+    # Price history
     series = _ron_series(history)
     trend = ""
     if len(series) >= 2:
         first, last = series[0], series[-1]
+        was_txt = ""
         if last < first:
             pct = (first - last) / first * 100
-            trend = (f'<div><span class="was">{first:.0f} RON</span> '
-                     f'<span class="drop-pct">−{pct:.0f}%</span></div>')
-        trend += _sparkline(series)
+            was_txt = f'<div class="was-row"><span class="was">{first:.0f} RON</span><span class="drop-pct">−{pct:.0f}%</span></div>'
+        trend = f'<div class="spark-wrap">{was_txt}{_sparkline(series)}</div>'
 
     fav_on = "on" if r.get("favorite") else ""
     fav_glyph = "★" if r.get("favorite") else "☆"
@@ -774,20 +1938,25 @@ def _card(sl, history: list | None = None, search_label: str | None = None,
 
     return f"""<div class="card {'deal' if sl.is_deal else ''} {seen_cls}{has_ai}"
    data-olx="{url}" data-id="{r.get('id')}">
-  <span class="fav-btn {fav_on}" title="Save to favorites"
-        onclick="toggleFav(event, this)">{fav_glyph}</span>
-  <span class="hide-btn" title="Hide from tracking"
-        onclick="hideCard(event, this)">✕</span>
-  <a class="olx imglink" {olx}>{img}</a>
+  <span class="fav-btn {fav_on}" title="Save to favorites" onclick="toggleFav(event, this)">{fav_glyph}</span>
+  <span class="hide-btn" title="Hide from tracking" onclick="hideCard(event, this)">✕</span>
+  <a class="olx imglink" {olx}>
+    <div class="thumb-wrap">{img_html}</div>
+  </a>
   <div class="body">
     <p class="title"><a class="olx" {olx}>{title}</a></p>
-    <div class="price">{price_txt}{orig}</div>
-    <div>{badges}{ai_badge}</div>
-    <div class="meta">{city}</div>
+    <div class="price-row">
+      <span class="price">{price_val}</span>
+      {orig}
+    </div>
+    <div class="badges-row">{badges}{ai_badge}</div>
+    <div class="meta-row">{meta_html}</div>
     {trend}
     {ai_panel}
-    <span class="seen-btn seen-toggle {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
-    {ai_action}
+    <div class="card-footer">
+      <span class="seen-btn seen-toggle {seen_on}" onclick="toggleSeen(event, this)">{seen_txt}</span>
+      {ai_action}
+    </div>
   </div>
 </div>"""
 
@@ -842,13 +2011,13 @@ def _menu_counts(store: Store, keys: list[str]) -> dict[str, tuple[int, int]]:
 
 
 def _stat_html(active: int, deals: int) -> str:
-    return f'<span class="stat">{active} · <span class="dl">{deals}&#9670;</span></span>'
+    deal_span = f'<span style="color:var(--accent-deal);font-weight:700">{deals}⚡</span>' if deals else '0⚡'
+    return f'<span class="stat" style="font-size:11px;color:var(--text-tertiary)">{active} · {deal_span}</span>'
 
 
 def _resolve_scope(config_path: str, db_path: str,
                    selected: str | None, group: str | None):
-    """Resolve which searches to show from ?search / ?group.
-    Returns (all_keys, groups, show, scope, selected, group)."""
+    """Resolve which searches to show from ?search / ?group."""
     all_keys = _search_keys(config_path, db_path)
     groups, _kg = _search_groups(config_path, db_path)
     if selected in all_keys:
@@ -856,6 +2025,25 @@ def _resolve_scope(config_path: str, db_path: str,
     if group in groups:
         return all_keys, groups, groups[group], "group", None, group
     return all_keys, groups, all_keys, "all", None, None
+
+
+def _pills_nav_bar(base: str, groups: dict, sel_search: str | None,
+                   sel_group: str | None, counts: dict, totals: tuple) -> str:
+    """Horizontal 1-tap pill navigation for quick group and search switching."""
+    pills = []
+    all_active = not sel_search and not sel_group
+    pills.append(f'<a class="pill-link {"active" if all_active else ""}" href="{base}">'
+                 f'All <span class="badge-num">{totals[0]}</span></a>')
+    for gname, keys in groups.items():
+        ga = sum(counts.get(k, (0, 0))[0] for k in keys)
+        gd = sum(counts.get(k, (0, 0))[1] for k in keys)
+        g_active = sel_group == gname
+        d_badge = f' ⚡{gd}' if gd else ''
+        pills.append(
+            f'<a class="pill-link {"active" if g_active else ""}" '
+            f'href="{base}?group={urllib.parse.quote(gname)}">'
+            f'{html.escape(gname)} <span class="badge-num">{ga}{d_badge}</span></a>')
+    return f'<div class="pills-nav">{"".join(pills)}</div>'
 
 
 def _grouped_menu(groups: dict, base: str, sel_search: str | None,
@@ -880,7 +2068,7 @@ def _grouped_menu(groups: dict, base: str, sel_search: str | None,
             f'<details class="grp" {"open" if expanded else ""}><summary>'
             f'<a class="grp-name {"on" if gsel else ""}" '
             f'href="{base}?group={urllib.parse.quote(gname)}">{html.escape(gname)}</a>'
-            f'{_stat_html(ga, gd)}<span class="grp-caret">&#9656;</span></summary>'
+            f'{_stat_html(ga, gd)}<span class="grp-caret">▶</span></summary>'
             f'<div class="grp-items">{inner}</div></details>')
 
     if sel_search:
@@ -893,15 +2081,14 @@ def _grouped_menu(groups: dict, base: str, sel_search: str | None,
     else:
         label, stat = "All searches", _stat_html(*totals)
     return (f'<details class="menu"><summary>'
-            f'<span class="burger">&#9776;</span>{label}'
-            f'<span class="sstat">· {stat}</span>'
-            f'<span class="caret">&#9662;</span></summary>'
+            f'<span>☰</span> <span>{label}</span>'
+            f'<span style="font-size:12px;margin-left:4px">{stat}</span>'
+            f'<span class="caret">▼</span></summary>'
             f'<div class="items">{"".join(rows)}</div></details>')
 
 
 def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
-    """Sort/filter controls, collapsed behind a 'Filters' toggle.
-    Opens by default only when a non-default filter is active."""
+    """Instant quick search + filter drawer."""
     def opt(name, value, label):
         sel = "selected" if f.get(name) == value else ""
         return f'<option value="{value}" {sel}>{label}</option>'
@@ -913,32 +2100,55 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
     checked = "checked" if f.get("hide_seen") else ""
     active = (f.get("sort", "deal") != "deal" or f.get("seller", "all") != "all"
               or f.get("pmin") or f.get("pmax") or f.get("hide_seen"))
-    summary = "Filters" + (" · active" if active else "")
-    form = f"""<form class="controls" method="get" action="/">{hidden}
-  Sort <select name="sort">
-    {opt('sort','deal','deal %')}{opt('sort','price_asc','price ↑')}
-    {opt('sort','price_desc','price ↓')}{opt('sort','newest','newest')}
-  </select>
-  Seller <select name="seller">
-    {opt('seller','all','all')}{opt('seller','private','private')}
-    {opt('seller','dealer','dealer')}
-  </select>
-  <input class="px" name="pmin" inputmode="numeric" placeholder="min"
-         value="{f.get('pmin') or ''}">–<input class="px" name="pmax"
-         inputmode="numeric" placeholder="max" value="{f.get('pmax') or ''}">RON
-  <label><input type="checkbox" name="hide_seen" value="1" {checked}> hide seen</label>
-  <button class="apply" type="submit">Apply</button>
-</form>"""
-    return (f'<details class="filterbox" {"open" if active else ""}>'
-            f'<summary>{summary}</summary>{form}</details>')
+    badge_html = '<span class="badge-filter">active</span>' if active else ""
+
+    return f"""<div class="toolbar">
+  <div class="quick-search-box">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input class="quick-search-input" id="client-search-input" placeholder="Type to filter listings on screen in real time..." oninput="filterCards(this.value)">
+  </div>
+  <details class="filter-panel" {"open" if active else ""}>
+    <summary>
+      <span>⚙️ Filters &amp; Sorting</span> {badge_html}
+      <span id="visible-count" style="margin-left:auto;font-size:11px;color:var(--text-tertiary)"></span>
+    </summary>
+    <form class="filter-form" method="get" action="/">{hidden}
+      <div class="filter-group">
+        <span>Sort</span>
+        <select name="sort">
+          {opt('sort','deal','⚡ Deal score')}
+          {opt('sort','price_asc','Price: Low to High')}
+          {opt('sort','price_desc','Price: High to Low')}
+          {opt('sort','newest','Newest listed')}
+        </select>
+      </div>
+      <div class="filter-group">
+        <span>Seller</span>
+        <select name="seller">
+          {opt('seller','all','All sellers')}
+          {opt('seller','private','Private only')}
+          {opt('seller','dealer','Dealer only')}
+        </select>
+      </div>
+      <div class="filter-group">
+        <span>Price (RON)</span>
+        <input class="px" name="pmin" inputmode="numeric" placeholder="Min" value="{f.get('pmin') or ''}">
+        <span>–</span>
+        <input class="px" name="pmax" inputmode="numeric" placeholder="Max" value="{f.get('pmax') or ''}">
+      </div>
+      <label class="toggle-label">
+        <input type="checkbox" name="hide_seen" value="1" {checked}> Hide seen
+      </label>
+      <button class="btn btn-primary" type="submit" style="padding:5px 12px;font-size:12px">Apply</button>
+      <a class="btn" href="/" style="padding:5px 10px;font-size:12px;color:var(--text-tertiary)">Clear</a>
+    </form>
+  </details>
+</div>"""
 
 
 def _matching_active_ids(db_path: str, config_path: str, selected: str | None,
                          group: str | None, seller: str, pmin: int | None,
                          pmax: int | None) -> list[int]:
-    """Ids of active, not-yet-seen listings matching the given scope+filters
-    (mirrors render_deals' `keep()`, minus the DISPLAY_CAP) — used by the
-    'mark all read' bulk action so it clears exactly what's on screen."""
     all_keys = _search_keys(config_path, db_path)
     groups, _kg = _search_groups(config_path, db_path)
     if selected in all_keys:
@@ -994,10 +2204,8 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         counts: dict[str, tuple[int, int]] = {}
         total_deals = total_active = shown_deals = 0
         sel_header = ""
-        # (search_key, ScoredListing, history) across every shown search.
         pool: list[tuple[str, Any, list | None]] = []
-        # Score every search (cheap) so the dropdown can show per-search stats;
-        # only pool listings for the search(es) actually being shown.
+
         for key in all_keys:
             active = store.active_for_search(key)
             sd = score_search(key, active)
@@ -1011,23 +2219,20 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             hist = store.histories([l.raw["id"] for l in sd.listings])
             for l in sd.listings:
                 pool.append((key, l, hist.get(l.raw["id"])))
-            if scope == "search":  # single search: one compact header line
-                med = f"{sd.median:.0f} RON" if sd.median else "—"
+            if scope == "search":
+                med = f"{sd.median:,.0f} RON".replace(",", ".") if sd.median else "—"
                 susp = len(sd.suspicious)
-                susp_txt = f" · {susp} too-cheap" if susp else ""
+                susp_txt = f' · <span style="color:var(--accent-susp)">{susp} too-cheap</span>' if susp else ""
                 if active:
                     sel_header = (
-                        f'<div class="search"><b>{html.escape(key)}</b> · '
-                        f'{len(active)} active · median {med} · '
-                        f'{ndeals} deal(s){susp_txt}</div>')
+                        f'<div class="chip" style="margin:6px 0;font-size:12px;padding:5px 10px">'
+                        f'<b>{html.escape(key)}</b> · {len(active)} active · median <b>{med}</b> · '
+                        f'<b>{ndeals} deal(s)</b>{susp_txt}</div>')
                 else:
-                    sel_header = ('<div class="note" style="margin:8px 16px 0">'
-                                  'No active listings — try Sync now.</div>')
+                    sel_header = ('<div class="empty">No active listings yet — try Sync now.</div>')
 
-        # --- filters ---
         def keep(sl) -> bool:
             r = sl.raw
-            # Drop 0-price / price-less junk (common on car listings).
             if sl.price_ron is None or sl.price_ron <= 0:
                 return False
             if seller == "private" and r.get("is_business"):
@@ -1044,18 +2249,17 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             return True
         pool = [t for t in pool if keep(t[1])]
 
-        # --- sort (then always sink 'seen' to the bottom, stably) ---
         if sort == "price_asc":
             pool.sort(key=lambda t: (t[1].price_ron is None, t[1].price_ron or 0))
         elif sort == "price_desc":
             pool.sort(key=lambda t: t[1].price_ron or 0, reverse=True)
         elif sort == "newest":
             pool.sort(key=lambda t: t[1].raw.get("created_time") or "", reverse=True)
-        else:  # deal %
+        else:
             pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
-        pool.sort(key=lambda t: bool(t[1].raw.get("seen")))  # unseen first, stable
+        pool.sort(key=lambda t: bool(t[1].raw.get("seen")))
         has_unseen = bool(pool) and not pool[0][1].raw.get("seen")
-        pool = pool[:DISPLAY_CAP]  # bound page weight after sort/filter
+        pool = pool[:DISPLAY_CAP]
 
         analyses = store.get_analyses([l.raw["id"] for _, l, _ in pool])
         cards = "".join(
@@ -1065,38 +2269,43 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
         if cards:
             body = sel_header + f'<div class="cards">{cards}</div>'
         else:
-            body = ('<div class="empty">No searches yet. '
-                    'Add one on Manage, then Sync now.</div>')
+            body = ('<div class="empty">No listings found matching the criteria.<br>'
+                    'Add a search on Manage or tap Sync now.</div>')
+
         mark_all = ""
         if has_unseen:
-            mark_all = f"""<form class="mark-all" method="post" action="/mark_all_seen">
+            mark_all = f"""<form style="display:flex;justify-content:flex-end;margin:4px 0" method="post" action="/mark_all_seen">
   <input type="hidden" name="search" value="{html.escape(selected or '')}">
   <input type="hidden" name="group" value="{html.escape(group or '')}">
   <input type="hidden" name="seller" value="{html.escape(seller)}">
   <input type="hidden" name="pmin" value="{pmin if pmin is not None else ''}">
   <input type="hidden" name="pmax" value="{pmax if pmax is not None else ''}">
   <input type="hidden" name="next" value="{html.escape(_tab_href('/'))}">
-  <button class="btn" type="submit">Mark all read</button>
+  <button class="btn" type="submit" style="font-size:12px;padding:4px 10px">Mark visible as read</button>
 </form>"""
-        menu = _grouped_menu(groups, "/", selected, group, counts,
-                             (total_active, total_deals))
-        content = (_sync_banner(store) + menu
-                   + _controls_bar(selected, group, f) + mark_all + body)
+
+        pills = _pills_nav_bar("/", groups, selected, group, counts, (total_active, total_deals))
+        menu = _grouped_menu(groups, "/", selected, group, counts, (total_active, total_deals))
+        controls = _controls_bar(selected, group, f)
+
+        content = _sync_banner(store) + pills + menu + controls + mark_all + body
+
+        market_chip = ""
+        if scope == "search" and selected:
+            mkt = analytics.compute_market_analytics(store, selected)
+            market_chip = analytics.render_mini_market_chip(mkt)
+
         if scope == "search":
-            scope_txt = f"'{selected}'"
+            scope_txt = f"{selected}"
         elif scope == "group":
-            scope_txt = f"group '{group}'"
+            scope_txt = f"Group: {group}"
         else:
-            scope_txt = f"{len(all_keys)} search(es)"
-        n24, c24 = store.ai_cost(24)
-        nT, cT = store.ai_cost()
-        ai_txt = (f" · AI ${c24:.2f}/24h · ${cT:.2f} total ({nT})"
-                  if nT else "")
-        sub = (f"{scope_txt} · {shown_deals} deal(s) · {_last_sync_text(store)} · "
-               f"EUR→RON {scorer.EUR_TO_RON:.2f}{ai_txt}")
+            scope_txt = f"All {len(all_keys)} searches"
+
+        sub_chips = _sub_chips_html(scope_txt, shown_deals, store, market_chip=market_chip)
     finally:
         store.close()
-    return _shell(sub, content, "deals", flash)
+    return _shell(sub_chips, content, "deals", flash)
 
 
 def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
@@ -1120,30 +2329,30 @@ def render_saved(db_path: str, config_path: str, flash: str = "") -> str:
         if cards_data:
             analyses = store.get_analyses(
                 [l.raw["id"] for _, _, l, _ in cards_data])
-            body = (f'<div class="cards">'
+            body = ('<div class="cards">'
                     + "".join(_card(l, h, search_label=key,
                                     analysis=analyses.get(l.raw["id"]))
                               for _, key, l, h in cards_data) + '</div>')
         else:
             body = ('<div class="empty">No saved listings yet.<br>'
-                    'Tap the ☆ on any card to save it here.</div>')
+                    'Tap the ☆ star on any card to bookmark it here.</div>')
         content = _sync_banner(store) + body
-        sub = f"{len(cards_data)} saved listing(s)"
+        sub_chips = (f'<span class="chip">★ {len(cards_data)} saved bookmark(s)</span>'
+                     f'<span class="chip">🕒 {_last_sync_text(store)}</span>')
     finally:
         store.close()
-    return _shell(sub, content, "saved", flash)
+    return _shell(sub_chips, content, "saved", flash)
 
 
 def render_drops(db_path: str, config_path: str, selected: str | None = None,
                  group: str | None = None, flash: str = "") -> str:
-    """Listings whose price has fallen since we first saw them, biggest first.
-    Drops that land in deal range are highlighted."""
+    """Listings whose price has fallen since we first saw them."""
     all_keys, groups, show, scope, selected, group = _resolve_scope(
         config_path, db_path, selected, group)
     store = Store(db_path)
     try:
         counts: dict[str, tuple[int, int]] = {}
-        cards: list[tuple[float, str]] = []
+        cards: list[tuple[float, str, Any, list | None]] = []
         for key in all_keys:
             active = store.active_for_search(key)
             sd = score_search(key, active)
@@ -1155,39 +2364,41 @@ def render_drops(db_path: str, config_path: str, selected: str | None = None,
                 series = _ron_series(hist.get(l.raw["id"]))
                 if len(series) >= 2 and series[-1] < series[0]:
                     pct = (series[0] - series[-1]) / series[0]
-                    cards.append((pct, l, hist.get(l.raw["id"])))
+                    cards.append((pct, key, l, hist.get(l.raw["id"])))
         cards.sort(key=lambda c: c[0], reverse=True)
         if cards:
-            analyses = store.get_analyses([l.raw["id"] for _, l, _ in cards])
+            analyses = store.get_analyses([l.raw["id"] for _, _, l, _ in cards])
             body = ('<div class="cards">'
-                    + "".join(_card(l, h, analysis=analyses.get(l.raw["id"]))
-                              for _, l, h in cards)
+                    + "".join(_card(l, h, search_label=key if scope != "search" else None,
+                                    analysis=analyses.get(l.raw["id"]))
+                              for _, key, l, h in cards)
                     + '</div>')
         else:
             body = ('<div class="empty">No price drops recorded yet.<br>'
-                    'Drops appear here once a tracked listing gets cheaper '
-                    'between syncs — check back after a day or two.</div>')
+                    'Price drops appear automatically when a listing price is lowered between syncs.</div>')
         totals = (sum(a for a, _ in counts.values()),
                   sum(d for _, d in counts.values()))
+        pills = _pills_nav_bar("/drops", groups, selected, group, counts, totals)
         menu = _grouped_menu(groups, "/drops", selected, group, counts, totals)
-        content = _sync_banner(store) + menu + body
-        scope_txt = (f"'{selected}'" if scope == "search" else
-                     f"group '{group}'" if scope == "group" else "all searches")
-        sub = f"{len(cards)} price drop(s) · {scope_txt}"
+        content = _sync_banner(store) + pills + menu + body
+        scope_txt = (f"{selected}" if scope == "search" else
+                     f"Group: {group}" if scope == "group" else "All searches")
+        sub_chips = (f'<span class="chip">📉 {len(cards)} price drop(s)</span>'
+                     f'<span class="chip">{scope_txt}</span>'
+                     f'<span class="chip">🕒 {_last_sync_text(store)}</span>')
     finally:
         store.close()
-    return _shell(sub, content, "drops", flash)
+    return _shell(sub_chips, content, "drops", flash)
 
 
 # ---------- trends (candlestick) page ----------
 
 def _candlestick(candles: list[dict], w: int = 340, h: int = 210) -> str:
-    """SVG candlestick: wick = day min–max, box = Q1–Q3, line = median.
-    Colour: green if median fell vs the previous day, red if it rose."""
+    """Polished SVG financial candlestick with grid and values."""
     if not candles:
-        return ('<div class="empty">No trend data yet.<br>One candle is added '
-                'per day as syncs run — check back tomorrow.</div>')
-    padL, padR, padT, padB = 46, 10, 12, 22
+        return ('<div class="empty">No trend data yet.<br>'
+                'Daily candles accumulate as sync runs — check back tomorrow.</div>')
+    padL, padR, padT, padB = 52, 12, 14, 26
     plot_w, plot_h = w - padL - padR, h - padT - padB
     lows = [c["low"] for c in candles if c["low"] is not None]
     highs = [c["high"] for c in candles if c["high"] is not None]
@@ -1201,45 +2412,45 @@ def _candlestick(candles: list[dict], w: int = 340, h: int = 210) -> str:
 
     n = len(candles)
     slot = plot_w / n
-    cw = min(slot * 0.6, 22)
+    cw = min(slot * 0.65, 24)
     p: list[str] = []
+
     for val in (lo, (lo + hi) / 2, hi):
         yy = y(val)
         p.append(f'<line x1="{padL}" y1="{yy:.1f}" x2="{w-padR}" y2="{yy:.1f}" '
-                 f'stroke="#262c36"/>')
-        p.append(f'<text x="{padL-6}" y="{yy+3:.1f}" text-anchor="end" '
-                 f'fill="#8a93a2" font-size="10">{val:.0f}</text>')
+                 f'stroke="var(--border-subtle)" stroke-dasharray="2 2"/>')
+        p.append(f'<text x="{padL-8}" y="{yy+3.5:.1f}" text-anchor="end" '
+                 f'fill="var(--text-tertiary)" font-size="9.5" font-family="JetBrains Mono">{val:,.0f}</text>')
 
     prev = None
     for i, c in enumerate(candles):
         cx = padL + slot * i + slot / 2
         med = c.get("median")
-        color = "#8a93a2"
+        color = "var(--text-secondary)"
         if prev is not None and med is not None:
-            color = ("#5fd08a" if med < prev else
-                     "#f0b6a0" if med > prev else "#8a93a2")
+            color = "#10b981" if med < prev else "#f43f5e" if med > prev else "var(--text-secondary)"
         if med is not None:
             prev = med
         if c["low"] is not None and c["high"] is not None:
             p.append(f'<line x1="{cx:.1f}" y1="{y(c["high"]):.1f}" '
                      f'x2="{cx:.1f}" y2="{y(c["low"]):.1f}" stroke="{color}" '
-                     f'stroke-width="1.4"/>')
+                     f'stroke-width="1.6" stroke-linecap="round"/>')
         q1, q3 = c.get("q1"), c.get("q3")
         if q1 is not None and q3 is not None:
             top, bot = y(max(q1, q3)), y(min(q1, q3))
             p.append(f'<rect x="{cx-cw/2:.1f}" y="{top:.1f}" width="{cw:.1f}" '
-                     f'height="{max(bot-top,2):.1f}" fill="{color}" '
-                     f'fill-opacity="0.25" stroke="{color}"/>')
+                     f'height="{max(bot-top, 3):.1f}" rx="2" fill="{color}" '
+                     f'fill-opacity="0.28" stroke="{color}" stroke-width="1.2"/>')
         if med is not None:
             p.append(f'<line x1="{cx-cw/2:.1f}" y1="{y(med):.1f}" '
                      f'x2="{cx+cw/2:.1f}" y2="{y(med):.1f}" stroke="{color}" '
-                     f'stroke-width="2"/>')
+                     f'stroke-width="2.2" stroke-linecap="round"/>')
 
-    p.append(f'<text x="{padL}" y="{h-6}" fill="#8a93a2" font-size="10">'
+    p.append(f'<text x="{padL}" y="{h-6}" fill="var(--text-tertiary)" font-size="10" font-family="JetBrains Mono">'
              f'{candles[0]["day"][5:]}</text>')
     if n > 1:
         p.append(f'<text x="{w-padR}" y="{h-6}" text-anchor="end" '
-                 f'fill="#8a93a2" font-size="10">{candles[-1]["day"][5:]}</text>')
+                 f'fill="var(--text-tertiary)" font-size="10" font-family="JetBrains Mono">{candles[-1]["day"][5:]}</text>')
     return (f'<svg class="candles" viewBox="0 0 {w} {h}" '
             f'xmlns="http://www.w3.org/2000/svg">{"".join(p)}</svg>')
 
@@ -1252,30 +2463,34 @@ def render_history(db_path: str, config_path: str, selected: str | None = None,
     try:
         counts = _menu_counts(store, all_keys)
         blocks = [
-            '<div class="note" style="margin:8px 16px 0">Daily candles · '
-            'wick = min–max · box = Q1–Q3 · line = median · '
-            'green = cheaper than previous day</div>']
+            '<div class="chip" style="margin:8px 0 12px;font-size:12px;padding:6px 12px">'
+            '📊 <b>Daily Price Candles</b> · Wick = Min–Max · Box = Q1–Q3 · Line = Median · Green = Price drop vs previous day</div>'
+        ]
         for key in show:
+            mkt = analytics.compute_market_analytics(store, key)
+            blocks.append(analytics.render_market_card(mkt))
             candles = store.daily_candles(key)
-            blocks.append(
-                f'<div class="search"><b>{html.escape(key)}</b> · '
-                f'{len(candles)} day(s) tracked</div>')
+            blocks.append('<div class="chart-card">')
+            blocks.append(f'<div class="chart-title">{html.escape(key)} — Daily Price History</div>')
             if candles:
                 last = candles[-1]
                 blocks.append(
-                    f'<div class="note" style="margin:0 16px 4px">latest: '
-                    f'min {last["low"]:.0f} · median {last["median"]:.0f} · '
-                    f'max {last["high"]:.0f} RON · {last["n"]} listings</div>')
-            blocks.append(f'<div class="chart">{_candlestick(candles)}</div>')
+                    f'<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">'
+                    f'Latest: Min <b>{last["low"]:,.0f}</b> · Median <b>{last["median"]:,.0f}</b> · '
+                    f'Max <b>{last["high"]:,.0f} RON</b> ({last["n"]} listings)</div>')
+            blocks.append(_candlestick(candles))
+            blocks.append('</div>')
         body = "".join(blocks)
         totals = (sum(a for a, _ in counts.values()),
                   sum(d for _, d in counts.values()))
+        pills = _pills_nav_bar("/history", groups, selected, group, counts, totals)
         menu = _grouped_menu(groups, "/history", selected, group, counts, totals)
-        content = _sync_banner(store) + menu + body
-        sub = "daily min / median / max per search"
+        content = _sync_banner(store) + pills + menu + body
+        sub_chips = (f'<span class="chip">📊 Price Trends &amp; Velocity</span>'
+                     f'<span class="chip">🕒 {_last_sync_text(store)}</span>')
     finally:
         store.close()
-    return _shell(sub, content, "trends", flash)
+    return _shell(sub_chips, content, "trends", flash)
 
 
 # ---------- management page ----------
@@ -1335,182 +2550,205 @@ def render_searches(config_path: str, db_path: str, edit_key: str | None = None,
     def selo(current, v):
         return "selected" if current == v else ""
 
-    discover_panel = """<div class="mng">
-  <label>Find model key &amp; category id (searches OLX live)</label>
+    discover_panel = """<div class="mng-box">
+  <h2>🔍 Model Key &amp; Category Finder</h2>
+  <p style="font-size:12px;color:var(--text-secondary);margin-bottom:10px">
+    Search OLX in real-time to find exact category IDs and model keys.
+  </p>
   <div class="row2">
-    <input id="dq" placeholder="iphone 15 pro"
+    <input class="form-input" id="dq" placeholder="e.g. iphone 15 pro, galaxy z fold 6, golf 7"
            onkeydown="if(event.key==='Enter'){event.preventDefault();doDiscover();}">
-    <button type="button" class="btn btn-go" style="flex:none" onclick="doDiscover()">Search</button>
+    <button type="button" class="btn btn-primary" style="flex:none" onclick="doDiscover()">Search</button>
   </div>
-  <div id="dres" class="note">Type a phone name, then tap a result to fill the form below.</div>
+  <div id="dres" style="margin-top:10px;font-size:12px;color:var(--text-tertiary)">
+    Type a keyword, then tap a result chip below to fill the form automatically.
+  </div>
 </div>
 <script>
 async function doDiscover(){
   const q=document.getElementById('dq').value.trim();
   const box=document.getElementById('dres');
-  if(!q){box.textContent='Type something first.';return;}
-  box.textContent='Searching OLX…';
+  if(!q){box.textContent='Type a search term first.';return;}
+  box.innerHTML='<span style="color:#60a5fa">Searching OLX taxonomy…</span>';
   try{
     const r=await fetch('/api/discover?q='+encodeURIComponent(q));
     const d=await r.json();
     let h='';
-    if(d.categories.length){h+='<div style="margin:6px 0">Category id (tap): ';
-      d.categories.forEach(c=>{h+='<span class="badge b-dealer" style="cursor:pointer" '+
-        'onclick="setCat('+c.id+')">'+c.id+' '+c.type+' ×'+c.n+'</span> ';});
-      h+='</div>';}
-    if(d.models.length){h+='<div>Model (tap): ';
-      d.models.forEach(m=>{const lbl=(m.label||m.key).replace(/</g,'');
-        h+='<span class="badge b-deal" style="cursor:pointer" '+
-        'onclick="setModel(\\''+m.key+'\\')">'+lbl+' ('+m.key+') ×'+m.n+'</span> ';});
-      h+='</div>';}
-    else{h+='No model filter here — use the free-text query field instead.';}
-    box.innerHTML=h||'No results.';
+    if(d.categories.length){
+      h+='<div style="margin:6px 0"><b style="color:var(--text-primary)">Category ID (tap to set):</b><br>';
+      d.categories.forEach(c=>{
+        h+='<span class="chip-pill b-dealer" onclick="setCat('+c.id+')">📁 '+c.id+' '+c.type+' <small>×'+c.n+'</small></span>';
+      });
+      h+='</div>';
+    }
+    if(d.models.length){
+      h+='<div style="margin:6px 0"><b style="color:var(--text-primary)">Model Key (tap to set):</b><br>';
+      d.models.forEach(m=>{
+        const lbl=(m.label||m.key).replace(/</g,'');
+        h+='<span class="chip-pill b-deal" onclick="setModel(\\''+m.key+'\\')">⚡ '+lbl+' <small>('+m.key+') ×'+m.n+'</small></span>';
+      });
+      h+='</div>';
+    }
+    box.innerHTML=h||'No structured models found — you can use the free-text query field instead.';
   }catch(e){box.textContent='Error: '+e;}
 }
-function setCat(id){document.querySelector('[name=category_id]').value=id;}
+function setCat(id){
+  document.querySelector('[name=category_id]').value=id;
+  showToast('Category ID set to ' + id, 'success');
+}
 function setModel(k){
   document.querySelector('[name=model]').value=k;
   const key=document.querySelector('[name=key]');
   if(!key.value && !key.hasAttribute('readonly')) key.value=k+'_used';
+  showToast('Model set to ' + k, 'success');
 }
 </script>
 """
 
-    form = discover_panel + f"""<form class="mng" method="post" action="/searches/add">
-  <label>Key (unique id)</label>
-  <input name="key" value="{val('key')}" placeholder="iphone_15_used" required
+    form = discover_panel + f"""<form class="mng-box" method="post" action="/searches/add">
+  <h2>{'✏️ Edit Search' if editing else '➕ Add Tracked Search'}</h2>
+  <label class="form-label">Key (Unique ID)</label>
+  <input class="form-input" name="key" value="{val('key')}" placeholder="e.g. iphone_15_pro_used" required
          {'readonly' if editing else ''}>
-  <label>Group (optional)</label>
-  <input name="group" value="{ed_group}" list="groups" placeholder="Fold, Phones, Cars…">
+  <label class="form-label">Group (Optional)</label>
+  <input class="form-input" name="group" value="{ed_group}" list="groups" placeholder="e.g. Phones, Fold, Cars…">
   <datalist id="groups">{datalist}</datalist>
-  <label>OLX model key (optional)</label>
-  <input name="model" value="{ed_model}" placeholder="iphone_15">
+  <label class="form-label">OLX Model Key (Optional)</label>
+  <input class="form-input" name="model" value="{ed_model}" placeholder="e.g. iphone_15_pro">
   <div class="row2">
-    <div><label>Condition</label>
-      <select name="state">
-        <option value="" {sel('')}>any</option>
-        <option value="used" {sel('used')}>used</option>
-        <option value="new" {sel('new')}>new</option>
-      </select></div>
-    <div><label>Category id (0 = all)</label>
-      <input name="category_id" value="{val('category_id','0')}"></div>
-  </div>
-  <label>Free-text query (optional; use instead of model)</label>
-  <input name="query" value="{val('query')}" placeholder="iphone 15 pro max">
-  <div class="row2">
-    <div><label>Price from (RON)</label>
-      <input name="price_from" value="{val('price_from')}" inputmode="numeric"></div>
-    <div><label>Price to (RON)</label>
-      <input name="price_to" value="{val('price_to')}" inputmode="numeric"></div>
-  </div>
-  <label>Region id (optional)</label>
-  <input name="region_id" value="{val('region_id')}" inputmode="numeric">
-  <details style="margin-top:10px" {'open' if (ed_yfrom or ed_yto or ed_mileage or ed_fuel or ed_gear) else ''}>
-    <summary style="cursor:pointer;color:#8a93a2;font-size:13px">Vehicle filters (optional)</summary>
-    <div class="row2">
-      <div><label>Year from</label>
-        <input name="year_from" value="{ed_yfrom}" inputmode="numeric" placeholder="2017"></div>
-      <div><label>Year to</label>
-        <input name="year_to" value="{ed_yto}" inputmode="numeric" placeholder="2020"></div>
+    <div>
+      <label class="form-label">Condition</label>
+      <select class="form-select" name="state">
+        <option value="" {sel('')}>Any condition</option>
+        <option value="used" {sel('used')}>Used (Second Hand)</option>
+        <option value="new" {sel('new')}>New</option>
+      </select>
     </div>
-    <label>Max mileage (km)</label>
-    <input name="mileage_to" value="{ed_mileage}" inputmode="numeric" placeholder="200000">
+    <div>
+      <label class="form-label">Category ID (0 = All)</label>
+      <input class="form-input" name="category_id" value="{val('category_id','0')}">
+    </div>
+  </div>
+  <label class="form-label">Free-text query (Optional)</label>
+  <input class="form-input" name="query" value="{val('query')}" placeholder="e.g. 256gb natural titanium">
+  <div class="row2">
+    <div>
+      <label class="form-label">Price Min (RON)</label>
+      <input class="form-input" name="price_from" value="{val('price_from')}" inputmode="numeric">
+    </div>
+    <div>
+      <label class="form-label">Price Max (RON)</label>
+      <input class="form-input" name="price_to" value="{val('price_to')}" inputmode="numeric">
+    </div>
+  </div>
+  <label class="form-label">Region ID (Optional)</label>
+  <input class="form-input" name="region_id" value="{val('region_id')}" inputmode="numeric">
+  <details style="margin-top:14px" {'open' if (ed_yfrom or ed_yto or ed_mileage or ed_fuel or ed_gear) else ''}>
+    <summary style="cursor:pointer;color:var(--text-secondary);font-size:13px;font-weight:600">🚗 Vehicle Filters (Optional)</summary>
     <div class="row2">
-      <div><label>Fuel</label>
-        <select name="fuel">
-          <option value="">any</option>
+      <div>
+        <label class="form-label">Year From</label>
+        <input class="form-input" name="year_from" value="{ed_yfrom}" inputmode="numeric" placeholder="2018">
+      </div>
+      <div>
+        <label class="form-label">Year To</label>
+        <input class="form-input" name="year_to" value="{ed_yto}" inputmode="numeric" placeholder="2022">
+      </div>
+    </div>
+    <label class="form-label">Max Mileage (km)</label>
+    <input class="form-input" name="mileage_to" value="{ed_mileage}" inputmode="numeric" placeholder="180000">
+    <div class="row2">
+      <div>
+        <label class="form-label">Fuel</label>
+        <select class="form-select" name="fuel">
+          <option value="">Any</option>
           <option value="diesel" {selo(ed_fuel,'diesel')}>Diesel</option>
           <option value="petrol" {selo(ed_fuel,'petrol')}>Benzină</option>
           <option value="hybrid" {selo(ed_fuel,'hybrid')}>Hibrid</option>
           <option value="lpg" {selo(ed_fuel,'lpg')}>GPL</option>
           <option value="electric" {selo(ed_fuel,'electric')}>Electric</option>
-        </select></div>
-      <div><label>Gearbox</label>
-        <select name="gearbox">
-          <option value="">any</option>
+        </select>
+      </div>
+      <div>
+        <label class="form-label">Gearbox</label>
+        <select class="form-select" name="gearbox">
+          <option value="">Any</option>
           <option value="automatic" {selo(ed_gear,'automatic')}>Automată</option>
           <option value="manual" {selo(ed_gear,'manual')}>Manuală</option>
-        </select></div>
+        </select>
+      </div>
     </div>
-    <div class="note" style="margin:6px 0 0">For cars: narrow year + mileage so the
-      median compares like-for-like. Leave blank for phones.</div>
   </details>
-  <details style="margin-top:10px" {'open' if (ed_wheel or ed_brand) else ''}>
-    <summary style="cursor:pointer;color:#8a93a2;font-size:13px">Bike filters (optional)</summary>
+  <details style="margin-top:12px" {'open' if (ed_wheel or ed_brand) else ''}>
+    <summary style="cursor:pointer;color:var(--text-secondary);font-size:13px;font-weight:600">🚲 Bike Filters (Optional)</summary>
     <div class="row2">
-      <div><label>Wheel size</label>
-        <select name="wheel">
-          <option value="">any</option>
+      <div>
+        <label class="form-label">Wheel Size</label>
+        <select class="form-select" name="wheel">
+          <option value="">Any</option>
           <option value="29_inch" {selo(ed_wheel,'29_inch')}>29"</option>
           <option value="27_5_inch" {selo(ed_wheel,'27_5_inch')}>27.5"</option>
           <option value="26_inch" {selo(ed_wheel,'26_inch')}>26"</option>
           <option value="28_inch" {selo(ed_wheel,'28_inch')}>28"</option>
-          <option value="20_inch" {selo(ed_wheel,'20_inch')}>20"</option>
-          <option value="16_inch" {selo(ed_wheel,'16_inch')}>16"</option>
-        </select></div>
-      <div><label>Brand</label>
-        <select name="brand">
-          <option value="">any</option>
+        </select>
+      </div>
+      <div>
+        <label class="form-label">Brand</label>
+        <select class="form-select" name="brand">
+          <option value="">Any</option>
           <option value="cube" {selo(ed_brand,'cube')}>Cube</option>
           <option value="specialized" {selo(ed_brand,'specialized')}>Specialized</option>
           <option value="scott" {selo(ed_brand,'scott')}>Scott</option>
-          <option value="focus" {selo(ed_brand,'focus')}>Focus</option>
+          <option value="trek" {selo(ed_brand,'trek')}>Trek</option>
           <option value="rockrider" {selo(ed_brand,'rockrider')}>Rockrider</option>
-          <option value="btwin" {selo(ed_brand,'btwin')}>B'Twin</option>
-          <option value="pegas" {selo(ed_brand,'pegas')}>Pegas</option>
-          <option value="alt_brand" {selo(ed_brand,'alt_brand')}>Other brand</option>
-        </select></div>
+        </select>
+      </div>
     </div>
-    <div class="note" style="margin:6px 0 0">Bikes have no type filter — put
-      "mountain bike" in the free-text query above. Category 987 = bikes.
-      Pick a single wheel size (OLX ignores multiple).</div>
   </details>
-  <div style="margin-top:12px; display:flex; gap:10px;">
-    <button class="btn btn-go" type="submit">
-      {'Save changes' if editing else 'Add search'}</button>
+  <div style="margin-top:16px;display:flex;gap:10px">
+    <button class="btn btn-primary" type="submit">{'Save Changes' if editing else 'Save & Track'}</button>
     {'<a class="btn" href="/searches">Cancel</a>' if editing else ''}
   </div>
-  <div class="note">Tip: with a model key, leave <b>Category id = 0</b> (all
-    categories) — OLX phone categories are per-brand (Apple 948, Samsung 956…),
-    so a fixed category can hide results. Use the finder above to get the model key.</div>
 </form>"""
 
     def srow(s: dict) -> str:
         key = html.escape(s.get("key", ""))
         paused = bool(s.get("paused"))
-        badge = ' <span class="badge b-susp">paused</span>' if paused else ''
+        badge = ' <span class="badge b-susp">paused</span>' if paused else '<span class="badge b-deal">active</span>'
         return f"""<div class="srow{' paused' if paused else ''}">
-  <div class="info"><div class="k">{key}{badge}</div>
-    <div class="d">{html.escape(_search_summary(s))}</div></div>
+  <div class="info">
+    <div class="k">{key} {badge}</div>
+    <div class="d">{html.escape(_search_summary(s))}</div>
+  </div>
   <form method="post" action="/searches/pause" style="margin:0">
     <input type="hidden" name="key" value="{key}">
-    <button class="btn" type="submit">{'Resume' if paused else 'Pause'}</button>
+    <button class="btn" type="submit" style="font-size:12px;padding:4px 8px">{'Resume' if paused else 'Pause'}</button>
   </form>
-  <a class="btn" href="/searches?edit={urllib.parse.quote(s.get('key',''))}">Edit</a>
+  <a class="btn" href="/searches?edit={urllib.parse.quote(s.get('key',''))}" style="font-size:12px;padding:4px 8px">Edit</a>
   <form method="post" action="/searches/delete" style="margin:0"
         onsubmit="return confirm('Delete {key}?')">
     <input type="hidden" name="key" value="{key}">
-    <button class="btn btn-del" type="submit">Delete</button>
+    <button class="btn btn-del" type="submit" style="font-size:12px;padding:4px 8px">Delete</button>
   </form>
 </div>"""
 
-    # Group the search list under group headers (config order of first appearance).
     grouped: dict[str, list[dict]] = {}
     for s in searches:
         grouped.setdefault((s.get("group") or "").strip() or "Other", []).append(s)
     listing = ""
     for gname, gsearches in grouped.items():
-        listing += (f'<div class="search"><b>{html.escape(gname)}</b> · '
-                    f'{len(gsearches)} search(es)</div>')
+        listing += (f'<div style="margin:14px 0 6px;font-weight:700;font-size:14px;color:var(--text-primary)">'
+                    f'{html.escape(gname)} ({len(gsearches)})</div>')
         listing += "".join(srow(s) for s in gsearches)
-    listing = listing or '<div class="empty">No searches yet.</div>'
-    content = form + '<div class="search"><b>Current searches</b></div>' + listing
+    listing = listing or '<div class="empty">No searches configured yet.</div>'
+    content = form + '<div class="mng-box"><h2>📋 Configured Searches</h2>' + listing + '</div>'
 
-    # Hidden listings — excluded via ✕ / long-press, restorable here.
+    # Hidden listings
     store = Store(db_path)
     try:
         banner = _sync_banner(store)
         hidden = store.excluded_listings()
+        last_sync = _last_sync_text(store)
     finally:
         store.close()
     content = banner + content
@@ -1518,22 +2756,24 @@ function setModel(k){
         hrows = []
         for h in hidden:
             title = html.escape((h.get("title") or "—")[:60])
-            price = f"{h.get('price'):.0f} {h.get('currency') or ''}".strip() \
-                if h.get("price") is not None else "—"
+            price = f"{h.get('price'):.0f} {h.get('currency') or ''}".strip() if h.get("price") is not None else "—"
             hrows.append(f"""<div class="srow">
-  <div class="info"><div class="k">{price}</div>
-    <div class="d">{html.escape(h.get('search_key',''))} · {title}</div></div>
+  <div class="info">
+    <div class="k">{price}</div>
+    <div class="d">{html.escape(h.get('search_key',''))} · {title}</div>
+  </div>
   <form method="post" action="/exclude" style="margin:0">
     <input type="hidden" name="id" value="{h.get('id')}">
     <input type="hidden" name="undo" value="1">
-    <button class="btn btn-go" type="submit">Restore</button>
+    <button class="btn btn-go" type="submit" style="font-size:12px;padding:4px 10px">Restore</button>
   </form>
 </div>""")
-        content += (f'<div class="search"><b>Hidden from tracking</b> · '
-                    f'{len(hidden)} listing(s)</div>' + "".join(hrows))
+        content += ('<div class="mng-box"><h2>🙈 Hidden Listings (' + str(len(hidden)) + ')</h2>'
+                    + "".join(hrows) + '</div>')
 
-    sub = f"{len(searches)} search(es) configured"
-    return _shell(sub, content, "searches", flash)
+    sub_chips = (f'<span class="chip">⚙️ {len(searches)} search(es) active</span>'
+                 f'<span class="chip">🕒 {last_sync}</span>')
+    return _shell(sub_chips, content, "searches", flash)
 
 
 # ---------- request handling ----------
@@ -1554,8 +2794,6 @@ def build_search(form: dict[str, str]) -> dict:
     key = _slug(form.get("key", ""))
     if not key:
         raise ValueError("key is required")
-    # 0 = all categories; safe default because a model filter is brand-specific
-    # on its own (OLX phone categories are per-brand: 948=Apple, 956=Samsung…).
     cat = _int_or_none(form.get("category_id"))
     s: dict = {"key": key, "category_id": cat if cat is not None else 0}
     group = form.get("group", "").strip()
@@ -1570,19 +2808,18 @@ def build_search(form: dict[str, str]) -> dict:
         filters["state"] = [state]
     fuel = form.get("fuel", "").strip()
     if fuel:
-        filters["petrol"] = [fuel]  # OLX enum name for fuel type
+        filters["petrol"] = [fuel]
     gearbox = form.get("gearbox", "").strip()
     if gearbox:
         filters["gearbox"] = [gearbox]
     wheel = form.get("wheel", "").strip()
     if wheel:
-        filters["dimensiune_roata"] = [wheel]  # OLX bike wheel-size enum
+        filters["dimensiune_roata"] = [wheel]
     brand = form.get("brand", "").strip()
     if brand:
         filters["brand"] = [brand]
     if filters:
         s["filters"] = filters
-    # Numeric range filters (vehicles): year, mileage.
     ranges: dict = {}
     yf, yt = _int_or_none(form.get("year_from")), _int_or_none(form.get("year_to"))
     if yf is not None or yt is not None:
@@ -1608,7 +2845,7 @@ def build_search(form: dict[str, str]) -> dict:
 
 
 SESSION_COOKIE = "olx_session"
-SESSION_TTL = 60 * 60 * 24 * 90  # 90 days — personal app, avoid re-login churn
+SESSION_TTL = 60 * 60 * 24 * 90
 
 
 def _sign(secret: bytes, payload: str) -> str:
@@ -1618,9 +2855,9 @@ def _sign(secret: bytes, payload: str) -> str:
 class Handler(BaseHTTPRequestHandler):
     db_path = "olxdeals.db"
     config_path = "searches.yaml"
-    push: "Push" = None  # set in main()
-    auth: tuple[str, str] | None = None  # (user, password) set in main(); None = auth disabled
-    secret: bytes = b""  # session-cookie signing key, set in main()
+    push: "Push" = None
+    auth: tuple[str, str] | None = None
+    secret: bytes = b""
 
     def _make_session_cookie(self) -> str:
         expiry = int(time.time()) + SESSION_TTL
@@ -1641,7 +2878,6 @@ class Handler(BaseHTTPRequestHandler):
         return time.time() < expiry and hmac.compare_digest(user, self.auth[0])
 
     def _check_auth(self) -> bool:
-        """Session-cookie gate. No-op (always True) when self.auth is None."""
         if self.auth is None:
             return True
         jar = http.cookies.SimpleCookie()
@@ -1682,7 +2918,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _static(self, path: str) -> None:
-        name = Path(path).name  # basename only — no directory traversal
+        name = Path(path).name
         fp = STATIC_DIR / name
         if not fp.is_file():
             self.send_error(404)
@@ -1716,7 +2952,7 @@ class Handler(BaseHTTPRequestHandler):
             subs = store.all_subscriptions()
             dead = self.push.notify_all(subs, {
                 "title": "OLX Deals",
-                "body": "Alerts are on. You'll be notified of new deals.",
+                "body": "Alerts are active. You will be notified of new deals.",
                 "url": "/",
                 "tag": "olx-test",
             })
@@ -1726,17 +2962,12 @@ class Handler(BaseHTTPRequestHandler):
             store.close()
 
     def _apply_fx(self) -> None:
-        """Load the cached EUR→RON rate so conversions/display are current."""
         store = Store(self.db_path)
         try:
             scorer.EUR_TO_RON = fx.current(store)
         finally:
             store.close()
 
-    # App-shell assets (no listing data) — must stay reachable without auth
-    # so mobile browsers can fetch them during PWA install (that fetch
-    # doesn't carry cached Basic Auth credentials, so gating them broke the
-    # home-screen icon).
     _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js", "/login"}
     _PUBLIC_PREFIXES = ("/static/",)
 
@@ -1752,7 +2983,6 @@ class Handler(BaseHTTPRequestHandler):
         flash = qs.get("msg", [""])[0]
         selected = qs.get("search", [None])[0]
         group = qs.get("group", [None])[0]
-        # Remember selected search/group + filters per view so tabs restore them.
         _remember("/" if parsed.path == "/index.html" else parsed.path, qs)
         if parsed.path in ("/", "/index.html"):
             filters = {
@@ -1794,6 +3024,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._json({"categories": cats, "models": models})
+        elif parsed.path == "/api/sync/status":
+            self._json(SyncTracker.get_state())
+        elif parsed.path == "/api/sync/events":
+            self._sse_sync_events()
         elif parsed.path == "/push/public-key":
             self._json({"key": self.push.public_key_b64()})
         elif parsed.path == "/manifest.webmanifest":
@@ -1817,7 +3051,7 @@ class Handler(BaseHTTPRequestHandler):
                 form = self._form()
                 next_path = form.get("next") or "/"
                 if not next_path.startswith("/") or next_path.startswith("//"):
-                    next_path = "/"  # only ever redirect within this app
+                    next_path = "/"
                 if (self.auth is not None
                         and hmac.compare_digest(form.get("user", ""), self.auth[0])
                         and hmac.compare_digest(form.get("pass", ""), self.auth[1])):
@@ -1846,7 +3080,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = self._form().get("key", "")
                 paused = config.toggle_paused(self.config_path, key)
                 self._redirect("/searches?msg=" + urllib.parse.quote(
-                    f"'{key}' {'paused — no longer refreshing' if paused else 'resumed'}."))
+                    f"'{key}' {'paused' if paused else 'resumed'}."))
             elif parsed.path == "/exclude":
                 form = self._form()
                 lid = _int_or_none(form.get("id"))
@@ -1861,7 +3095,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._redirect("/searches?msg=" + urllib.parse.quote(
                         "Listing restored to tracking."))
                 else:
-                    self.send_response(204)  # async ✕ / long-press call
+                    self.send_response(204)
                     self.end_headers()
             elif parsed.path in ("/favorite", "/seen"):
                 form = self._form()
@@ -1876,7 +3110,7 @@ class Handler(BaseHTTPRequestHandler):
                             store.set_seen(lid, on)
                     finally:
                         store.close()
-                self.send_response(204)  # async star / seen toggle
+                self.send_response(204)
                 self.end_headers()
             elif parsed.path == "/mark_all_seen":
                 form = self._form()
@@ -1923,15 +3157,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._run_analysis(_int_or_none(self._form().get("id")))
             elif parsed.path == "/sync":
                 self._trigger_sync()
-                # Return to the Deals view with its remembered search + filters.
-                base = _tab_href("/")
-                sep = "&" if "?" in base else "?"
-                self._redirect(base + sep + "msg=" + urllib.parse.quote(
-                    "Sync started — refresh in ~30s to see results."))
+                accept = self.headers.get("Accept", "")
+                if "application/json" in accept:
+                    self._json({"ok": True, "status": "started", "sync": SyncTracker.get_state()})
+                else:
+                    base = _tab_href("/")
+                    sep = "&" if "?" in base else "?"
+                    self._redirect(base + sep + "msg=" + urllib.parse.quote(
+                        "Sync started... tracking progress live."))
             else:
                 self.send_error(404)
-        except Exception as exc:  # surface errors back to the page
+        except Exception as exc:
             self._redirect("/searches?msg=" + urllib.parse.quote(f"Error: {exc}"))
+
+    def _sse_sync_events(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        q = SyncTracker.register_listener()
+        try:
+            init_data = f"data: {json.dumps(SyncTracker.get_state())}\n\n".encode("utf-8")
+            self.wfile.write(init_data)
+            self.wfile.flush()
+
+            while True:
+                try:
+                    state = q.get(timeout=12.0)
+                    msg = f"data: {json.dumps(state)}\n\n".encode("utf-8")
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.error):
+            pass
+        finally:
+            SyncTracker.unregister_listener(q)
 
     def _deactivate(self, key: str) -> None:
         store = Store(self.db_path)
@@ -1943,7 +3208,6 @@ class Handler(BaseHTTPRequestHandler):
             store.close()
 
     def _run_analysis(self, listing_id: int | None) -> None:
-        """On-demand LLM analysis for one listing (synchronous, ~20-60s)."""
         import os
         if listing_id is None:
             self.send_error(400)
@@ -1971,8 +3235,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
-    # One at a time: a second Refresh while the first is still fetching would
-    # duplicate every request for no benefit.
     _sync_lock = threading.Lock()
     _sync_thread: threading.Thread | None = None
 
@@ -1982,15 +3244,6 @@ class Handler(BaseHTTPRequestHandler):
         return bool(t and t.is_alive())
 
     def _trigger_sync(self) -> None:
-        """Run one sync cycle in a thread of this process.
-
-        This used to ask systemd to start olx-sync.service, which runs
-        `podman exec olx-deals python run.py` -- issued from inside that very
-        container, where there is no systemctl and no podman. It had been
-        failing with ENOENT ever since the dashboard was containerised. The
-        unit and its hourly timer are unchanged; this is the same work, in the
-        process that already holds the database and the config.
-        """
         with Handler._sync_lock:
             if Handler.sync_running():
                 return
@@ -2000,21 +3253,28 @@ class Handler(BaseHTTPRequestHandler):
 
     @classmethod
     def _sync_once(cls) -> None:
-        # Imported here rather than at module load: the dashboard has to start
-        # even if a sync dependency is unhappy, and this is the rarer path.
         import run as sync
 
         args = SimpleNamespace(config=cls.config_path, db=cls.db_path,
                                delay=1.0, jitter=0.5, quiet=True)
         summary: list[dict] = []
+        SyncTracker.update(running=True, step=0, total=0, current_key="",
+                           new_count=0, deal_count=0, message="Initializing sync...",
+                           started_at=datetime.now(timezone.utc).isoformat(),
+                           finished_at=None)
         try:
             fetcher = sync.OlxFetcher(delay=args.delay, jitter=args.jitter)
             push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
-            sync._run_all(args, fetcher, push, summary)
+            sync._run_all(args, fetcher, push, summary,
+                          progress_cb=lambda info: SyncTracker.update(**info))
             sync.notify_ntfy(summary)
-        except Exception as exc:  # noqa: BLE001 -- a background thread has
-            # nowhere to raise; the log is the only place this can surface.
+            new_tot = sum(s.get('new', 0) for s in summary if s.get('ok'))
+            SyncTracker.update(running=False, finished_at=datetime.now(timezone.utc).isoformat(),
+                               message=f"Sync complete ({new_tot} new item(s))")
+        except Exception as exc:
             print(f"sync failed: {exc}", flush=True)
+            SyncTracker.update(running=False, finished_at=datetime.now(timezone.utc).isoformat(),
+                               message=f"Sync error: {exc}")
 
     def log_message(self, *a):
         pass
@@ -2030,13 +3290,11 @@ def main() -> None:
 
     Handler.db_path = args.db
     Handler.config_path = args.config
-    # VAPID key lives next to the DB so the sync process finds the same one.
     Handler.push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
     user = os.environ.get("DASHBOARD_USER")
     password = os.environ.get("DASHBOARD_PASS")
     if user and password:
         Handler.auth = (user, password)
-        # Persisted so sessions survive dashboard restarts/deploys.
         secret_path = Path(args.db).resolve().with_name("session_secret.key")
         if not secret_path.exists():
             secret_path.write_bytes(secrets.token_bytes(32))

@@ -141,16 +141,42 @@ def main() -> None:
         raise SystemExit(1)
 
 
-def _run_all(args, fetcher, push, summary: list[dict]) -> int:
+def _run_all(args, fetcher, push, summary: list[dict],
+             progress_cb=None) -> int:
     """Run the sync for every active search; return the failure count."""
     failures = 0
     with Store(args.db) as store:
         # Refresh the EUR→RON rate (~once/day) so conversions stay accurate.
         scorer.EUR_TO_RON = fx.refresh(store)
         active_specs = [s for s in load_searches(args.config) if not s.paused]
+        total_searches = len(active_specs)
+        total_new = 0
+        total_deals = 0
+
+        if progress_cb:
+            progress_cb({
+                "running": True,
+                "step": 0,
+                "total": total_searches,
+                "current_key": "",
+                "new_count": 0,
+                "deal_count": 0,
+                "message": f"Starting sync for {total_searches} active searches...",
+            })
+
         for i, spec in enumerate(active_specs):
             if i:  # gentle gap between searches to avoid burst-throttling
                 time.sleep(random.uniform(1.5, 3.5))
+            if progress_cb:
+                progress_cb({
+                    "running": True,
+                    "step": i + 1,
+                    "total": total_searches,
+                    "current_key": spec.key,
+                    "new_count": total_new,
+                    "deal_count": total_deals,
+                    "message": f"Fetching ({i+1}/{total_searches}): {spec.key}",
+                })
             started = time.monotonic()
             try:
                 # Fetch fully before touching the DB: a mid-pagination failure
@@ -174,7 +200,33 @@ def _run_all(args, fetcher, push, summary: list[dict]) -> int:
             store.record_run(spec.key, ok=True, duration_ms=dur, result=result)
             summary.append({"key": spec.key, "ok": True,
                             "new": len(result.new), "removed": len(result.removed)})
+            total_new += len(result.new)
+            sd = score_search(spec.key, active)
+            new_deals = [sl for sl in sd.listings
+                         if sl.raw["id"] in {l["id"] for l in result.new} and sl.is_deal]
+            total_deals += len(new_deals)
             report(result, args.quiet)
+            if progress_cb:
+                progress_cb({
+                    "running": True,
+                    "step": i + 1,
+                    "total": total_searches,
+                    "current_key": spec.key,
+                    "new_count": total_new,
+                    "deal_count": total_deals,
+                    "message": f"Finished {spec.key} (+{len(result.new)} new)",
+                })
+
+        if progress_cb:
+            progress_cb({
+                "running": False,
+                "step": total_searches,
+                "total": total_searches,
+                "current_key": "",
+                "new_count": total_new,
+                "deal_count": total_deals,
+                "message": f"Sync complete: {total_new} new items, {total_deals} deals found",
+            })
     return failures
 
 

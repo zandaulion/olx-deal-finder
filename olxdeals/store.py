@@ -375,13 +375,21 @@ class Store:
         ).fetchall()
         return {r["listing_id"]: dict(r) for r in rows}
 
-    def add_subscription(self, sub: dict[str, Any]) -> None:
+    def add_subscription(self, sub: dict[str, Any], device_id: int | None = None) -> None:
         keys = sub.get("keys") or {}
-        self.conn.execute(
-            "INSERT OR REPLACE INTO push_subscriptions "
-            "(endpoint, p256dh, auth, created) VALUES (?, ?, ?, ?)",
-            (sub["endpoint"], keys.get("p256dh"), keys.get("auth"), _now()),
-        )
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(push_subscriptions)")}
+        if "device_id" in cols:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO push_subscriptions "
+                "(endpoint, p256dh, auth, created, device_id) VALUES (?, ?, ?, ?, ?)",
+                (sub["endpoint"], keys.get("p256dh"), keys.get("auth"), _now(), device_id),
+            )
+        else:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO push_subscriptions "
+                "(endpoint, p256dh, auth, created) VALUES (?, ?, ?, ?)",
+                (sub["endpoint"], keys.get("p256dh"), keys.get("auth"), _now()),
+            )
         self.conn.commit()
 
     def remove_subscription(self, endpoint: str) -> None:

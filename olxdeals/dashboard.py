@@ -147,7 +147,7 @@ self.addEventListener('notificationclick', (e) => {
 });
 """
 
-from . import analytics, config, fx, scorer
+from . import accounts, analytics, config, fx, scorer
 from .discover import discover
 from .push import Push
 from .scorer import score_search, to_ron
@@ -1126,39 +1126,87 @@ _CSS = """
     line-height: 1.6;
   }
 
-  /* Login page */
-  .login-wrap {
+  /* Gate (Invite required) */
+  .gate-wrap {
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 16px;
   }
-  form.login {
+  .gate-card {
     width: 100%;
-    max-width: 360px;
+    max-width: 420px;
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg);
     padding: 24px;
     box-shadow: var(--shadow-float);
   }
-  form.login h1 {
-    font-family: var(--font-heading);
-    font-size: 22px;
-    font-weight: 700;
-    margin-bottom: 6px;
+  .gate-header {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .gate-header h1 {
+    font-family: var(--font-heading);
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.02em;
+  }
+  .gate-lead {
+    color: var(--text-secondary);
+    font-size: 13.5px;
+    line-height: 1.5;
+    margin-bottom: 16px;
+  }
+  .code-input {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    text-align: center;
+    font-weight: 600;
+  }
+  .gate-warn {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: rgba(224, 86, 36, 0.1);
+    border: 1px solid rgba(224, 86, 36, 0.3);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .gate-hint {
+    margin-top: 18px;
+    padding: 12px;
+    background: var(--bg-subtle);
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+  .gate-hint strong {
+    color: var(--text-primary);
   }
 """
 
-_LOGIN_PAGE = """<!doctype html>
+_GATE_PAGE = """<!doctype html>
 <html lang="ro"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>OLX Deals — Sign In</title>
+<title>OLX Deals — Necesită invitație</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#090c10">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OLX Deals">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="icon" type="image/png" href="/static/icon-192.png">
 <script>
 (function() {{
   try {{
@@ -1169,29 +1217,139 @@ _LOGIN_PAGE = """<!doctype html>
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>{css}</style></head><body>
-<div class="login-wrap">
-<form class="login" method="post" action="/login">
-  <h1><div class="brand-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></svg></div> OLX Deals</h1>
-  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Sign in to access your deal tracker.</p>
-  {error}
-  <input type="hidden" name="next" value="{next}">
-  <label class="form-label">Username</label>
-  <input class="form-input" name="user" autocomplete="username" autofocus required>
-  <label class="form-label">Password</label>
-  <input class="form-input" name="pass" type="password" autocomplete="current-password" required>
-  <button class="btn btn-primary" type="submit" style="width:100%;margin-top:16px;padding:10px">Sign in</button>
-</form>
+<div class="gate-wrap">
+  <div class="gate-card">
+    <div class="gate-header">
+      <div class="brand-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg></div>
+      <h1 id="gate-title">{title}</h1>
+    </div>
+    <p class="gate-lead" id="gate-lead">{lead}</p>
+    {error_html}
+    <form id="form-code" method="post" action="/activate">
+      <input type="hidden" name="next" value="{next}">
+      <input class="form-input code-input" id="invite-code" name="code" value="{code_value}"
+             autocomplete="off" autocapitalize="characters" spellcheck="false"
+             placeholder="ABCD-EFGH-JKLM" aria-label="Cod de invitație" required autofocus>
+      <button class="btn btn-primary" type="submit" id="btn-activate" style="width:100%;margin-top:12px;padding:12px;font-size:15px">{btn_label}</button>
+    </form>
+    <p class="err" id="gate-err" style="display:none;margin-top:12px;color:var(--bad);font-size:13px"></p>
+
+    <div class="gate-warn" id="gate-inapp" style="display:none">
+      <strong>Ai deschis pagina în browserul din WhatsApp.</strong>
+      <p style="margin:4px 0 8px 0;font-size:12.5px;line-height:1.4">Acesta are cookie-uri proprii, așa că aplicația instalată ulterior nu va fi autentificată. Continuă în browserul propriu-zis — codul te însoțește.</p>
+      <div class="warn-actions" style="display:flex;gap:8px;margin-top:8px">
+        <a class="btn btn-sm btn-ghost" id="open-chrome" href="#" style="display:none">Deschide în Chrome</a>
+        <button class="btn btn-sm btn-ghost" id="copy-code" type="button">Copiază codul</button>
+      </div>
+      <p id="inapp-note" style="margin-top:8px;font-size:11.5px;color:var(--text-secondary)"></p>
+    </div>
+
+    <div class="gate-hint">
+      <strong>Pe iPhone:</strong> adaugă întâi pagina pe ecranul principal (Distribuie → Adaugă pe ecranul principal), apoi deschide-o de acolo și introdu codul. Notificările funcționează doar din aplicația instalată.
+    </div>
+  </div>
 </div>
+<script>
+(function() {{
+  function inAppBrowser() {{
+    var ua = navigator.userAgent || '';
+    return /\\bwv\\b/.test(ua) || /(FBAN|FBAV|Instagram|Line\\/|WhatsApp|Snapchat|Messenger)/i.test(ua);
+  }}
+  function isAndroid() {{ return /Android/i.test(navigator.userAgent || ''); }}
+
+  var code = document.getElementById('invite-code').value.trim();
+  var box = document.getElementById('gate-inapp');
+  if (box && inAppBrowser()) {{
+    box.style.display = 'block';
+    var url = location.origin + '/?code=' + encodeURIComponent(code);
+    var chrome = document.getElementById('open-chrome');
+    if (isAndroid() && code && chrome) {{
+      chrome.href = 'intent://' + url.replace(/^https?:\\/\\//, '') + '#Intent;scheme=https;package=com.android.chrome;S.browser_fallback_url=' + encodeURIComponent(url) + ';end';
+      chrome.style.display = 'inline-flex';
+    }}
+    var note = document.getElementById('inapp-note');
+    if (note) {{
+      note.textContent = isAndroid()
+        ? 'În Chrome: instalează aplicația din meniul ⋮, deschide-o de pe ecranul principal, apoi introdu codul. Poți activa de mai multe ori în prima oră.'
+        : 'Deschide ' + location.host + ' în Safari, adaugă pagina pe ecranul principal, deschide-o de acolo, apoi introdu codul.';
+    }}
+    var copyBtn = document.getElementById('copy-code');
+    if (copyBtn) {{
+      copyBtn.onclick = function() {{
+        var c = document.getElementById('invite-code').value;
+        if (navigator.clipboard && window.isSecureContext) {{
+          navigator.clipboard.writeText(c).then(function() {{ copyBtn.textContent = 'Copiat'; setTimeout(function(){{copyBtn.textContent='Copiază codul';}}, 1500); }});
+        }} else {{
+          var ta = document.createElement('textarea');
+          ta.value = c;
+          ta.style.position = 'fixed';
+          ta.style.top = '0';
+          ta.style.left = '0';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try {{ document.execCommand('copy'); copyBtn.textContent = 'Copiat'; setTimeout(function(){{copyBtn.textContent='Copiază codul';}}, 1500); }} catch(e){{}}
+          document.body.removeChild(ta);
+        }}
+      }};
+    }}
+  }}
+
+  var form = document.getElementById('form-code');
+  if (form) {{
+    form.addEventListener('submit', async function(e) {{
+      if (window.fetch) {{
+        e.preventDefault();
+        var btn = document.getElementById('btn-activate');
+        var err = document.getElementById('gate-err');
+        var codeVal = document.getElementById('invite-code').value.trim();
+        err.style.display = 'none';
+        btn.disabled = true;
+        btn.textContent = 'Se activează…';
+        try {{
+          var res = await fetch('/api/invites/redeem', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{code: codeVal}})
+          }});
+          var data = await res.json().catch(function(){{ return {{}}; }});
+          if (!res.ok) throw new Error(data.detail || 'Activarea a eșuat (' + res.status + ')');
+          location.href = '{next}' || '/';
+        }} catch(ex) {{
+          err.textContent = ex.message || 'Activarea a eșuat.';
+          err.style.display = 'block';
+          btn.disabled = false;
+          btn.textContent = '{btn_label}';
+        }}
+      }}
+    }});
+  }}
+}})();
+</script>
 </body></html>"""
 
 
-def render_login(error: str, next_path: str) -> str:
-    error_html = ('<div class="flash warn">Wrong username or password</div>'
+def render_gate(prefill: str = "", error: str = "", next_path: str = "/") -> str:
+    has_code = bool(prefill and prefill.strip())
+    title = "Activează acest dispozitiv" if has_code else "Necesită invitație"
+    lead = ("Această invitație înregistrează dispozitivul pe care o citești acum."
+            if has_code else
+            "Aplicația este doar pe bază de invitație. Dacă ai primit un link sau un cod, "
+            "introdu-l mai jos ca să înregistrezi acest dispozitiv.")
+    btn_label = "Activează acest dispozitiv" if has_code else "Activează"
+    error_html = (f'<div class="flash warn" style="margin-bottom:14px">{html.escape(error)}</div>'
                   if error else "")
-    return _LOGIN_PAGE.format(
-        css=_CSS, error=error_html, next=html.escape(next_path or "/"))
+    return _GATE_PAGE.format(
+        css=_CSS,
+        title=title,
+        lead=lead,
+        btn_label=btn_label,
+        code_value=html.escape(prefill or ""),
+        error_html=error_html,
+        next=html.escape(next_path or "/"),
+    )
 
 
 _SHELL = """<!doctype html>
@@ -2844,53 +3002,48 @@ def build_search(form: dict[str, str]) -> dict:
     return s
 
 
-SESSION_COOKIE = "olx_session"
-SESSION_TTL = 60 * 60 * 24 * 90
-
-
-def _sign(secret: bytes, payload: str) -> str:
-    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
 class Handler(BaseHTTPRequestHandler):
     db_path = "olxdeals.db"
     config_path = "searches.yaml"
     push: "Push" = None
-    auth: tuple[str, str] | None = None
-    secret: bytes = b""
 
-    def _make_session_cookie(self) -> str:
-        expiry = int(time.time()) + SESSION_TTL
-        payload = f"{self.auth[0]}:{expiry}"
-        return f"{payload}:{_sign(self.secret, payload)}"
+    def _check_admin(self) -> bool:
+        """Admin routes live on the tailnet listener, which injects X-Admin: 1."""
+        return self.headers.get("X-Admin") == "1"
 
-    def _valid_session_cookie(self, token: str) -> bool:
-        user, _, rest = token.partition(":")
-        expiry_s, _, sig = rest.partition(":")
-        if not (user and expiry_s and sig):
-            return False
-        if not hmac.compare_digest(sig, _sign(self.secret, f"{user}:{expiry_s}")):
-            return False
-        try:
-            expiry = int(expiry_s)
-        except ValueError:
-            return False
-        return time.time() < expiry and hmac.compare_digest(user, self.auth[0])
+    def _get_client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "127.0.0.1"
 
-    def _check_auth(self) -> bool:
-        if self.auth is None:
-            return True
+    def _get_cookie(self, name: str) -> str | None:
         jar = http.cookies.SimpleCookie()
         jar.load(self.headers.get("Cookie", ""))
-        morsel = jar.get(SESSION_COOKIE)
-        if morsel and self._valid_session_cookie(morsel.value):
-            return True
-        next_path = self.path if self.command == "GET" else "/"
-        location = "/login"
-        if next_path not in ("/", "/login"):
-            location += "?next=" + urllib.parse.quote(next_path, safe="")
-        self._redirect(location)
-        return False
+        morsel = jar.get(name)
+        return morsel.value if morsel else None
+
+    def _get_current_device(self) -> dict | None:
+        token = self._get_cookie(accounts.COOKIE_NAME)
+        return accounts.device_by_token(token) if token else None
+
+    def _check_auth(self) -> dict | None:
+        dev = self._get_current_device()
+        if dev:
+            return dev
+        if self.path.startswith("/api/"):
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "detail": "Acest dispozitiv nu este înregistrat. Ai nevoie de o invitație."
+            }).encode("utf-8"))
+            return None
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        code = qs.get("code", [""])[0] or qs.get("invite", [""])[0]
+        self._html(render_gate(prefill=code, next_path=self.path if self.command == "GET" else "/"))
+        return None
 
     def _html(self, body: str, status: int = 200) -> None:
         data = body.encode("utf-8")
@@ -2900,9 +3053,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _json(self, obj) -> None:
+    def _json(self, obj, status: int = 200) -> None:
         data = json.dumps(obj).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -2968,7 +3121,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
-    _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js", "/login"}
+    _PUBLIC_PATHS = {"/manifest.webmanifest", "/sw.js", "/activate", "/api/invites/redeem"}
     _PUBLIC_PREFIXES = ("/static/",)
 
     def _is_public(self, path: str) -> bool:
@@ -2976,8 +3129,50 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        if not self._is_public(parsed.path) and not self._check_auth():
+
+        # Admin API endpoints (tailnet listener with X-Admin: 1)
+        if parsed.path.startswith("/api/admin/"):
+            if not self._check_admin():
+                self.send_error(404)
+                return
+            if parsed.path == "/api/admin/devices":
+                self._json({"devices": accounts.list_devices()})
+                return
+            elif parsed.path == "/api/admin/invites":
+                base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+                invites = accounts.list_invites()
+                for i in invites:
+                    code = i.pop("code_plain", None)
+                    i["code"] = code
+                    i["url"] = f"{base}/?code={code}" if code and base else None
+                self._json({"invites": invites, "ttl_days": accounts.INVITE_TTL.days})
+                return
+            else:
+                self.send_error(404)
+                return
+
+        # Public endpoints
+        if parsed.path == "/manifest.webmanifest":
+            self._raw(json.dumps(MANIFEST).encode("utf-8"),
+                      "application/manifest+json")
             return
+        elif parsed.path == "/sw.js":
+            self._raw(SW_JS.encode("utf-8"), "application/javascript",
+                      {"Service-Worker-Allowed": "/"})
+            return
+        elif parsed.path.startswith("/static/"):
+            self._static(parsed.path)
+            return
+        elif parsed.path == "/activate":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = qs.get("code", [""])[0] or qs.get("invite", [""])[0]
+            self._html(render_gate(prefill=code, next_path=qs.get("next", ["/"])[0]))
+            return
+
+        # Authenticated endpoints
+        if not self._check_auth():
+            return
+
         self._apply_fx()
         qs = urllib.parse.parse_qs(parsed.query)
         flash = qs.get("msg", [""])[0]
@@ -3006,10 +3201,6 @@ class Handler(BaseHTTPRequestHandler):
             edit_key = qs.get("edit", [None])[0]
             self._html(render_searches(
                 self.config_path, self.db_path, edit_key, flash))
-        elif parsed.path == "/login":
-            error = qs.get("error", [""])[0]
-            next_path = qs.get("next", ["/"])[0]
-            self._html(render_login(error, next_path))
         elif parsed.path == "/api/discover":
             q = qs.get("q", [""])[0].strip()
             cats: list = []
@@ -3030,42 +3221,122 @@ class Handler(BaseHTTPRequestHandler):
             self._sse_sync_events()
         elif parsed.path == "/push/public-key":
             self._json({"key": self.push.public_key_b64()})
-        elif parsed.path == "/manifest.webmanifest":
-            self._raw(json.dumps(MANIFEST).encode("utf-8"),
-                      "application/manifest+json")
-        elif parsed.path == "/sw.js":
-            self._raw(SW_JS.encode("utf-8"), "application/javascript",
-                      {"Service-Worker-Allowed": "/"})
-        elif parsed.path.startswith("/static/"):
-            self._static(parsed.path)
         else:
             self.send_error(404)
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if not self._is_public(parsed.path) and not self._check_auth():
-            return
-        self._apply_fx()
-        try:
-            if parsed.path == "/login":
-                form = self._form()
-                next_path = form.get("next") or "/"
-                if not next_path.startswith("/") or next_path.startswith("//"):
-                    next_path = "/"
-                if (self.auth is not None
-                        and hmac.compare_digest(form.get("user", ""), self.auth[0])
-                        and hmac.compare_digest(form.get("pass", ""), self.auth[1])):
+
+        # Admin API endpoints
+        if parsed.path.startswith("/api/admin/"):
+            if not self._check_admin():
+                self.send_error(404)
+                return
+            if parsed.path == "/api/admin/invites":
+                payload = self._json_body()
+                label = (payload.get("label") or "").strip()[:60] or None
+                code = accounts.create_invite(label)
+                base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+                self._json({
+                    "code": code,
+                    "url": f"{base}/?code={code}" if base else None,
+                    "expires_in_days": accounts.INVITE_TTL.days,
+                    "label": label,
+                })
+                return
+            elif re.match(r"^/api/admin/invites/(\d+)/revoke$", parsed.path):
+                m = re.match(r"^/api/admin/invites/(\d+)/revoke$", parsed.path)
+                invite_id = int(m.group(1))
+                if not accounts.revoke_invite(invite_id):
+                    self.send_error(404, "no such unused invite")
+                    return
+                self._json({"revoked": invite_id})
+                return
+            elif parsed.path == "/api/admin/invites/prune":
+                self._json({"deleted": accounts.prune_invites()})
+                return
+            elif re.match(r"^/api/admin/devices/(\d+)/revoke$", parsed.path):
+                m = re.match(r"^/api/admin/devices/(\d+)/revoke$", parsed.path)
+                device_id = int(m.group(1))
+                payload = self._json_body()
+                revoked = bool(payload.get("revoked", True))
+                if not accounts.set_revoked(device_id, revoked):
+                    self.send_error(404, "no such device")
+                    return
+                self._json({"id": device_id})
+                return
+            elif re.match(r"^/api/admin/devices/(\d+)/label$", parsed.path):
+                m = re.match(r"^/api/admin/devices/(\d+)/label$", parsed.path)
+                device_id = int(m.group(1))
+                label = (self._json_body().get("label") or "").strip()[:60]
+                if not accounts.rename_device(device_id, label):
+                    self.send_error(404, "no such device")
+                    return
+                self._json({"id": device_id, "label": label})
+                return
+            elif parsed.path == "/api/admin/devices/prune":
+                self._json({"deleted": accounts.prune_devices()})
+                return
+            else:
+                self.send_error(404)
+                return
+
+        # Public invite redemption endpoints
+        if parsed.path in ("/activate", "/api/invites/redeem"):
+            is_json = parsed.path.startswith("/api/")
+            body = self._json_body() if is_json else self._form()
+            raw_code = body.get("code", "")
+            code = accounts.normalise_code(raw_code)
+            next_path = body.get("next") or "/"
+            if not next_path.startswith("/") or next_path.startswith("//"):
+                next_path = "/"
+            client_ip = self._get_client_ip()
+
+            if accounts.throttled(client_ip):
+                msg = "Prea multe încercări. Reîncearcă într-un minut."
+                if is_json:
+                    self._json({"detail": msg}, status=429)
+                else:
+                    self._html(render_gate(prefill=code, error=msg, next_path=next_path), status=429)
+                return
+
+            try:
+                device_id, token = accounts.redeem(code)
+                cookie_val = (f"{accounts.COOKIE_NAME}={token}; Path=/; "
+                              f"Max-Age={accounts.COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax")
+                if is_json:
+                    data = json.dumps({"ok": True, "device_id": device_id}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Set-Cookie", cookie_val)
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
                     self.send_response(303)
                     self.send_header("Location", next_path)
-                    self.send_header(
-                        "Set-Cookie",
-                        f"{SESSION_COOKIE}={self._make_session_cookie()}; Path=/; "
-                        f"Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Lax")
+                    self.send_header("Set-Cookie", cookie_val)
                     self.end_headers()
+            except accounts.InviteError as ex:
+                if is_json:
+                    self._json({"detail": str(ex)}, status=400)
                 else:
-                    self._redirect("/login?error=1&next="
-                                    + urllib.parse.quote(next_path, safe=""))
-            elif parsed.path == "/searches/add":
+                    self._html(render_gate(prefill=raw_code, error=str(ex), next_path=next_path), status=400)
+            except Exception as ex:
+                if is_json:
+                    self._json({"detail": f"Eroare: {ex}"}, status=500)
+                else:
+                    self._html(render_gate(prefill=raw_code, error=f"Eroare: {ex}", next_path=next_path), status=500)
+            return
+
+        # Authenticated POST actions
+        dev = self._check_auth()
+        if not dev:
+            return
+
+        self._apply_fx()
+        try:
+            if parsed.path == "/searches/add":
                 search = build_search(self._form())
                 config.upsert_search(self.config_path, search)
                 self._redirect("/searches?msg=" + urllib.parse.quote(
@@ -3134,7 +3405,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sub.get("endpoint"):
                     store = Store(self.db_path)
                     try:
-                        store.add_subscription(sub)
+                        store.add_subscription(sub, device_id=dev.get("id"))
                     finally:
                         store.close()
                 self.send_response(204)
@@ -3169,6 +3440,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except Exception as exc:
             self._redirect("/searches?msg=" + urllib.parse.quote(f"Error: {exc}"))
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/admin/"):
+            if not self._check_admin():
+                self.send_error(404)
+                return
+            m = re.match(r"^/api/admin/devices/(\d+)$", parsed.path)
+            if m:
+                device_id = int(m.group(1))
+                if not accounts.delete_device(device_id):
+                    self.send_error(404, "no such device")
+                    return
+                self._json({"deleted": device_id})
+                return
+        self.send_error(404)
 
     def _sse_sync_events(self) -> None:
         self.send_response(200)
@@ -3291,20 +3578,10 @@ def main() -> None:
     Handler.db_path = args.db
     Handler.config_path = args.config
     Handler.push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
-    user = os.environ.get("DASHBOARD_USER")
-    password = os.environ.get("DASHBOARD_PASS")
-    if user and password:
-        Handler.auth = (user, password)
-        secret_path = Path(args.db).resolve().with_name("session_secret.key")
-        if not secret_path.exists():
-            secret_path.write_bytes(secrets.token_bytes(32))
-            secret_path.chmod(0o600)
-        Handler.secret = secret_path.read_bytes()
-        print("Login (session cookie) auth enabled")
-    else:
-        print("WARNING: DASHBOARD_USER/DASHBOARD_PASS not set — dashboard has NO auth")
+    accounts.configure(args.db)
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"OLX dashboard on http://{args.host}:{args.port}/  (Ctrl-C to stop)")
+    print(f"OLX dashboard on http://{args.host}:{args.port}/ (device auth enabled)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

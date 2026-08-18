@@ -67,6 +67,19 @@ def configure(path: str | Path) -> None:
     _db_path = str(path)
     with _connect() as con:
         con.executescript(SCHEMA)
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "push_subscriptions" in tables:
+            cols = {r["name"] for r in con.execute(
+                "PRAGMA table_info(push_subscriptions)").fetchall()}
+            if "device_id" not in cols:
+                try:
+                    con.execute(
+                        "ALTER TABLE push_subscriptions ADD COLUMN device_id "
+                        "INTEGER REFERENCES devices(id) ON DELETE SET NULL")
+                    con.commit()
+                except sqlite3.OperationalError:
+                    pass
 
 
 def _connect() -> sqlite3.Connection:
@@ -151,9 +164,18 @@ def device_by_token(token: str) -> dict | None:
 
 def list_devices() -> list[dict]:
     with _connect() as con:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        has_device_col = False
+        if "push_subscriptions" in tables:
+            cols = {r["name"] for r in con.execute(
+                "PRAGMA table_info(push_subscriptions)").fetchall()}
+            has_device_col = "device_id" in cols
+        push_expr = ("(SELECT COUNT(*) FROM push_subscriptions p WHERE p.device_id = d.id) AS has_push"
+                     if has_device_col else "0 AS has_push")
         return [dict(r) for r in con.execute(
-            "SELECT id, label, created_at, last_seen, revoked, 0 AS has_push "
-            "FROM devices ORDER BY id")]
+            f"SELECT d.id, d.label, d.created_at, d.last_seen, d.revoked, {push_expr} "
+            "FROM devices d ORDER BY d.id")]
 
 
 def set_revoked(device_id: int, revoked: bool) -> bool:
@@ -173,6 +195,13 @@ def rename_device(device_id: int, label: str) -> bool:
 
 def delete_device(device_id: int) -> bool:
     with _connect() as con:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "push_subscriptions" in tables:
+            cols = {r["name"] for r in con.execute(
+                "PRAGMA table_info(push_subscriptions)").fetchall()}
+            if "device_id" in cols:
+                con.execute("DELETE FROM push_subscriptions WHERE device_id = ?", (device_id,))
         cur = con.execute("DELETE FROM devices WHERE id = ?", (device_id,))
         con.commit()
         return cur.rowcount > 0

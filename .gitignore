@@ -6,7 +6,8 @@
 # VAPID private key for web-push (secret; generated on first run)
 vapid_key.pem
 
-# Session-cookie signing key (secret; generated on first run)
+# Session & site env
+site.env
 session_secret.key
 
 # Python

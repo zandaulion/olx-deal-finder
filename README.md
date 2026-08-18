@@ -73,8 +73,7 @@ loginctl enable-linger "$USER"                       # run without being logged 
 
 install -d -m 700 ~/.config/olx-deals
 cat > ~/.config/olx-deals/olx.env <<'ENV'
-DASHBOARD_USER=you
-DASHBOARD_PASS=something-long
+PUBLIC_BASE_URL=https://olx.yourdomain.com
 NTFY_URL=https://ntfy.sh/pick-something-unguessable
 ANTHROPIC_API_KEY=
 ENV
@@ -95,11 +94,15 @@ Everything mutable lives in the named volume `olx-deals-data`: `olxdeals.db`,
 key must survive rebuilds** — regenerating it silently invalidates every push
 subscription already granted, with no error anywhere.
 
-Two things that are easy to get wrong:
+### Device & Invite Authentication
 
-* `DASHBOARD_USER`/`DASHBOARD_PASS` are what stand between the dashboard and
-  whoever can reach it. Unset, it serves with **no authentication at all** and
-  only prints a warning. Set them before exposing it.
+Access is managed through single-use device invites (via the shared
+`pwa-invite-console` or the `./admin.sh` CLI):
+
+* No usernames or passwords. Each invite binds exactly one device token in an
+  `HttpOnly` cookie.
+* Manage invites and devices via the tailnet-only `pwa-invite-console` PWA or
+  via `./admin.sh invite "My Phone"`.
 * `NTFY_URL` defaults to `https://ntfy.sh/monitoring`, a public topic anyone
   can read and post to. Pick your own.
 * The env file is read by *rootless podman itself*, as your user — so it must

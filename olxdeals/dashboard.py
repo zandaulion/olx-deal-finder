@@ -186,10 +186,14 @@ _CSS = """
     --accent-danger: #f43f5e;
     --accent-danger-bg: rgba(244, 63, 94, 0.15);
 
-    --bg-card-unread: #121824;
+    --bg-card-unread: #161d2b;
     --bg-card-read: #0b0e15;
-    --border-card-unread: rgba(255, 255, 255, 0.08);
+    --border-card-unread: rgba(255, 255, 255, 0.12);
     --border-card-read: rgba(255, 255, 255, 0.04);
+    /* Read state needs its own text colour: --text-secondary is tuned for
+       labels on an unread card, not for signalling "already handled". */
+    --text-read: #6b7a90;
+    --accent-deal-bg-read: rgba(16, 185, 129, 0.05);
 
     --radius-sm: 8px;
     --radius-md: 12px;
@@ -215,9 +219,11 @@ _CSS = """
     --border-focus: #2563eb;
 
     --bg-card-unread: #ffffff;
-    --bg-card-read: #dbe4ee;
+    --bg-card-read: #ccd8e6;
     --border-card-unread: #cbd5e1;
-    --border-card-read: #bcc7d5;
+    --border-card-read: #aab8c9;
+    --text-read: #64748b;
+    --accent-deal-bg-read: rgba(4, 120, 87, 0.05);
 
     --text-primary: #020617;
     --text-secondary: #1e293b;
@@ -710,9 +716,26 @@ _CSS = """
     border-color: var(--accent-deal-border);
     background: linear-gradient(180deg, var(--accent-deal-bg) 0%, var(--bg-card-unread) 100%);
   }
+  /* Unread marker.
+     Dimming alone cannot carry this state: a read card can only recede so far
+     before it stops being readable, and on a .deal card the green gradient
+     masks what little difference is left. So unread gets a positive mark and
+     read is simply its absence -- the same reason mail clients use a dot
+     rather than a slightly paler row. One colour for one meaning: the rail
+     says "unread" regardless of whether the card is also a deal. */
+  .card:not(.seen)::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 10px;
+    bottom: 10px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: var(--accent-brand);
+  }
   .card.deal.seen {
     border-color: var(--border-card-read);
-    background: linear-gradient(180deg, var(--accent-deal-bg) 0%, var(--bg-card-read) 100%);
+    background: linear-gradient(180deg, var(--accent-deal-bg-read) 0%, var(--bg-card-read) 100%);
   }
   .card.seen {
     background: var(--bg-card-read);
@@ -720,14 +743,17 @@ _CSS = """
     box-shadow: none;
   }
   .card.seen .title a {
-    color: var(--text-secondary);
-    font-weight: 500;
+    color: var(--text-read);
+    font-weight: 400;
   }
   .card.seen .thumb-wrap {
     border-color: var(--border-card-read);
   }
+  /* The photo is the largest object in the card, so it carries the state
+     further down the page than any text treatment can. */
   .card.seen .thumb {
-    opacity: 0.92;
+    opacity: 0.5;
+    filter: grayscale(0.4);
   }
   .card.sw-fav { box-shadow: inset 8px 0 0 0 var(--accent-fav), var(--shadow-card); }
   .card.sw-seen { box-shadow: inset -8px 0 0 0 var(--accent-brand), var(--shadow-card); }

@@ -3580,7 +3580,7 @@ class Handler(BaseHTTPRequestHandler):
             push = Push(Path(args.db).resolve().with_name("vapid_key.pem"))
             sync._run_all(args, fetcher, push, summary,
                           progress_cb=lambda info: SyncTracker.update(**info))
-            sync.notify_ntfy(summary)
+            sync.notify_ntfy(summary, args.db)
             new_tot = sum(s.get('new', 0) for s in summary if s.get('ok'))
             SyncTracker.update(running=False, finished_at=datetime.now(timezone.utc).isoformat(),
                                message=f"Sync complete ({new_tot} new item(s))")

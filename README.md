@@ -105,6 +105,27 @@ Access is managed through single-use device invites (via the shared
   via `./admin.sh invite "My Phone"`.
 * `NTFY_URL` defaults to `https://ntfy.sh/monitoring`, a public topic anyone
   can read and post to. Pick your own.
+
+### What goes where
+
+Two channels, and they carry different things:
+
+* **Web push** → new deals, to the PWA. This is the product.
+* **ntfy** → operations only. Sync failures, and the recovery that closes
+  them. A healthy sync says nothing.
+
+The sync runs hourly, so an unconditional status message meant 24 notifications
+a day. That trains you to swipe the topic away, which is precisely when a real
+failure goes unread — so healthy syncs are silent.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NTFY_REPEAT_HOURS` | `6` | While a failure persists, re-notify at most this often. A problem lasting all day should not go quiet after its first mention. |
+| `NTFY_HEARTBEAT_HOURS` | `0` (off) | Set to e.g. `24` for one liveness ping a day. Worth considering: with problems-only reporting, silence cannot distinguish "healthy" from "the timer stopped firing". |
+
+State lives in the `meta` table (`ntfy_state`, `ntfy_last_fail`,
+`ntfy_last_beat`), so notifications are edge-triggered across runs rather than
+recomputed from scratch each sync.
 * The env file is read by *rootless podman itself*, as your user — so it must
   be owned by you, not root. Root ownership just makes it unreadable.
 

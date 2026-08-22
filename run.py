@@ -13,6 +13,7 @@ import argparse
 import os
 import random
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -65,8 +66,33 @@ def _post_ntfy(title: str, body: str, priority: str, tags: str) -> None:
         print(f"ntfy notify failed: {exc}")
 
 
-def notify_ntfy(summary: list[dict]) -> None:
-    """Publish a per-sync status heartbeat to ntfy."""
+# ntfy carries operations, not deals -- new listings go to the PWA over web
+# push (see notify_new_deals). The sync runs hourly, so posting a healthy
+# summary every time produced 24 messages a day and trained the eye to swipe
+# the topic away, which is exactly when a real failure gets missed.
+#
+# So: report problems, report the recovery that closes them, and otherwise say
+# nothing. Repeats of an *ongoing* failure are rate-limited rather than
+# suppressed -- a problem that persists for a day should not go quiet after its
+# first mention.
+NTFY_REPEAT_HOURS = float(os.environ.get("NTFY_REPEAT_HOURS", "6"))
+# Off by default. Silence cannot distinguish "healthy" from "the timer stopped
+# firing", so set this to e.g. 24 to keep one liveness ping a day.
+NTFY_HEARTBEAT_HOURS = float(os.environ.get("NTFY_HEARTBEAT_HOURS", "0"))
+
+
+def _hours_since(iso: str | None) -> float:
+    if not iso:
+        return float("inf")
+    try:
+        return (datetime.now(timezone.utc)
+                - datetime.fromisoformat(iso)).total_seconds() / 3600
+    except ValueError:
+        return float("inf")
+
+
+def notify_ntfy(summary: list[dict], db_path: str | None = None) -> None:
+    """Publish sync *problems* to ntfy. Healthy syncs are silent."""
     ok = [s for s in summary if s["ok"]]
     bad = [s for s in summary if not s["ok"]]
     total_new = sum(s.get("new", 0) for s in ok)
@@ -78,12 +104,40 @@ def notify_ntfy(summary: list[dict]) -> None:
         else:
             lines.append(f"{s['key']}: FAILED — {s['error'][:70]}")
     body = "\n".join(lines) or "no active searches (all paused)"
-    if bad:  # failures are urgent — max priority so they actually ping
-        _post_ntfy(f"OLX sync: {len(ok)}/{len(summary)} ok, {len(bad)} FAILED",
-                   body, "max", "rotating_light")
-    else:  # healthy heartbeat — lowest priority, silent, logged to history
-        _post_ntfy(f"OLX sync: {len(ok)} ok, {total_new} new",
-                   body, "min", "white_check_mark")
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Without a database we cannot tell a new failure from a continuing one.
+    # Degrade to reporting every failure rather than staying quiet.
+    if not db_path:
+        if bad:
+            _post_ntfy(f"OLX sync: {len(ok)}/{len(summary)} ok, {len(bad)} FAILED",
+                       body, "max", "rotating_light")
+        return
+
+    with Store(db_path) as store:
+        was_failing = store.get_meta("ntfy_state") == "fail"
+        if bad:
+            if not was_failing or _hours_since(
+                    store.get_meta("ntfy_last_fail")) >= NTFY_REPEAT_HOURS:
+                _post_ntfy(
+                    f"OLX sync: {len(ok)}/{len(summary)} ok, {len(bad)} FAILED",
+                    body, "max", "rotating_light")
+                store.set_meta("ntfy_last_fail", now)
+            store.set_meta("ntfy_state", "fail")
+            return
+
+        store.set_meta("ntfy_state", "ok")
+        if was_failing:  # close the loop so a fixed problem is known to be fixed
+            _post_ntfy(f"OLX sync recovered: {len(ok)} ok, {total_new} new",
+                       body, "low", "white_check_mark")
+            store.set_meta("ntfy_last_beat", now)
+            return
+
+        if NTFY_HEARTBEAT_HOURS and _hours_since(
+                store.get_meta("ntfy_last_beat")) >= NTFY_HEARTBEAT_HOURS:
+            _post_ntfy(f"OLX sync alive: {len(ok)} ok, {total_new} new",
+                       body, "min", "white_check_mark")
+            store.set_meta("ntfy_last_beat", now)
 
 
 def notify_new_deals(store, push, search_key, active, result) -> None:
@@ -136,7 +190,7 @@ def main() -> None:
         _post_ntfy("OLX sync CRASHED", str(exc)[:200], "max", "rotating_light")
         raise
 
-    notify_ntfy(summary)
+    notify_ntfy(summary, args.db)
     if failures:
         raise SystemExit(1)
 

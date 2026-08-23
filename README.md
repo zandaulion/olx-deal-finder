@@ -22,6 +22,10 @@ price-drop history and per-listing exclusions.
   live **model-key & category finder** so you don't have to hunt through OLX URLs.
 - **Manual exclusion** — hide a mislabeled/unwanted listing (✕ button or long-press);
   it's removed from the stats and stays hidden on future syncs, restorable from Manage.
+- **Triage by swipe** — swipe a card left to mark it seen, right to favourite, or use
+  the buttons. Unread cards carry an accent rail down the left edge; seen cards drop the
+  rail, fade the photo and lighten the title. `Hide seen` clears them from the view
+  entirely once a search has been worked through.
 - **Runs itself** — hourly sync + always-on dashboard via systemd user services.
 
 ## How OLX data works (useful to know)
@@ -103,31 +107,9 @@ Access is managed through single-use device invites (via the shared
   `HttpOnly` cookie.
 * Manage invites and devices via the tailnet-only `pwa-invite-console` PWA or
   via `./admin.sh invite "My Phone"`.
-* `NTFY_URL` defaults to `https://ntfy.sh/monitoring`, a public topic anyone
-  can read and post to. Pick your own.
-
-### What goes where
-
-Two channels, and they carry different things:
-
-* **Web push** → new deals, to the PWA. This is the product.
-* **ntfy** → operations only. Sync failures, and the recovery that closes
-  them. A healthy sync says nothing.
-
-The sync runs hourly, so an unconditional status message meant 24 notifications
-a day. That trains you to swipe the topic away, which is precisely when a real
-failure goes unread — so healthy syncs are silent.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `NTFY_REPEAT_HOURS` | `6` | While a failure persists, re-notify at most this often. A problem lasting all day should not go quiet after its first mention. |
-| `NTFY_HEARTBEAT_HOURS` | `0` (off) | Set to e.g. `24` for one liveness ping a day. Worth considering: with problems-only reporting, silence cannot distinguish "healthy" from "the timer stopped firing". |
-
-State lives in the `meta` table (`ntfy_state`, `ntfy_last_fail`,
-`ntfy_last_beat`), so notifications are edge-triggered across runs rather than
-recomputed from scratch each sync.
 * The env file is read by *rootless podman itself*, as your user — so it must
   be owned by you, not root. Root ownership just makes it unreadable.
+* `NTFY_URL` lives in the same env file — see [Notifications](#notifications).
 
 ### Moving an existing install
 
@@ -140,6 +122,28 @@ tar czf olx-data.tgz olxdeals.db searches.yaml vapid_key.pem   # on the old host
 
 It stops the service, copies through `podman cp` so ownership lands right, and
 starts it again. Bring `vapid_key.pem` — see above.
+
+## Notifications
+
+Two channels, carrying different things:
+
+* **Web push** → new deals, to the PWA. This is the product.
+* **ntfy** → operations only. Sync failures, and the recovery that closes them.
+  A healthy sync says nothing.
+
+The sync runs hourly, so an unconditional status message meant 24 notifications
+a day, of which roughly 24 said everything was fine. That trains you to swipe
+the topic away, which is precisely when a real failure goes unread.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NTFY_URL` | `https://ntfy.sh/monitoring` | Where operational alerts go. **Change it** — the default is a public topic anyone can read and post to. |
+| `NTFY_REPEAT_HOURS` | `6` | While a failure persists, re-notify at most this often. A problem lasting all day should not go quiet after its first mention. |
+| `NTFY_HEARTBEAT_HOURS` | `0` (off) | Set to e.g. `24` for one liveness ping a day. Worth considering: with problems-only reporting, silence cannot distinguish "healthy" from "the timer stopped firing". |
+
+State lives in the `meta` table (`ntfy_state`, `ntfy_last_fail`,
+`ntfy_last_beat`), so a failure and its recovery are detected as transitions
+across separate sync runs rather than recomputed from scratch each time.
 
 ## Layout
 

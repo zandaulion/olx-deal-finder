@@ -757,6 +757,10 @@ _CSS = """
   }
   .card.sw-fav { box-shadow: inset 8px 0 0 0 var(--accent-fav), var(--shadow-card); }
   .card.sw-seen { box-shadow: inset -8px 0 0 0 var(--accent-brand), var(--shadow-card); }
+  /* While a swipe is in progress its feedback owns the card edges: the gold
+     favourite bar lands on the same left edge as the unread rail. */
+  .card.sw-fav::before,
+  .card.sw-seen::before { opacity: 0; }
 
   /* Absolute card action buttons */
   .fav-btn, .hide-btn {

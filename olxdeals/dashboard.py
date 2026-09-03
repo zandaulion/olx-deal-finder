@@ -3542,10 +3542,10 @@ class Handler(BaseHTTPRequestHandler):
         if listing_id is None:
             self.send_error(400)
             return
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
             self.send_response(500)
             self.end_headers()
-            self.wfile.write(b"ANTHROPIC_API_KEY not configured")
+            self.wfile.write(b"GEMINI_API_KEY not configured")
             return
         store = Store(self.db_path)
         try:

@@ -79,7 +79,7 @@ install -d -m 700 ~/.config/olx-deals
 cat > ~/.config/olx-deals/olx.env <<'ENV'
 PUBLIC_BASE_URL=https://olx.yourdomain.com
 NTFY_URL=https://ntfy.sh/pick-something-unguessable
-ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
 ENV
 chmod 600 ~/.config/olx-deals/olx.env
 
@@ -155,7 +155,7 @@ olxdeals/
   discover.py    find category ids & model keys from real listings
   config.py      read/write searches.yaml
   dashboard.py   zero-dependency web UI (Deals / Drops / Manage)
-  analyzer.py    optional per-listing LLM verdict (Anthropic)
+  analyzer.py    optional per-listing LLM verdict (Gemini Flash 3.8)
   push.py        self-served VAPID web push
 run.py           one sync cycle (used by the timer)
 searches.yaml    your tracked searches
@@ -166,9 +166,9 @@ deploy/          Containerfile, quadlet units, data import
 
 - The `EUR→RON` rate is a constant in `scorer.py` — update it occasionally.
 - The local `olxdeals.db` is git-ignored; it's rebuilt by running the sync.
-- The ✦ analyze button calls Anthropic and costs real money per listing —
-  a few cents each at Opus pricing. `llm_analysis.cost_usd` records what each
-  one cost. Leave `ANTHROPIC_API_KEY` empty and the rest of the app works
+- The ✦ analyze button calls Gemini Flash 3.8 and costs real money per listing —
+  fractions of a cent per listing. `llm_analysis.cost_usd` records what each
+  one cost. Leave `GEMINI_API_KEY` empty and the rest of the app works
   unchanged; only that button fails.
 
 ## Licence

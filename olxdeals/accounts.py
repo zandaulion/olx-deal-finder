@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS invites (
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     used_at    TEXT,
+    -- Cancelled, rather than deleted, so the console can show that an invite
+    -- was withdrawn instead of leaving a gap indistinguishable from one that
+    -- was never sent.
+    revoked    INTEGER NOT NULL DEFAULT 0,
     device_id  INTEGER REFERENCES devices(id) ON DELETE SET NULL
 );
 """
@@ -67,6 +71,15 @@ def configure(path: str | Path) -> None:
     _db_path = str(path)
     with _connect() as con:
         con.executescript(SCHEMA)
+        # Cancelling an invite used to delete the row; it is flagged now, so an
+        # existing database needs the column. Every surviving row is live by
+        # definition -- the cancelled ones were already deleted.
+        invite_cols = {r["name"] for r in con.execute(
+            "PRAGMA table_info(invites)").fetchall()}
+        if "revoked" not in invite_cols:
+            con.execute(
+                "ALTER TABLE invites ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
+            con.commit()
         tables = {r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if "push_subscriptions" in tables:
@@ -232,14 +245,18 @@ def create_invite(label: str | None = None) -> str:
 def list_invites() -> list[dict]:
     with _connect() as con:
         return [dict(r) for r in con.execute(
-            "SELECT id, label, created_at, expires_at, used_at, device_id, code_plain "
-            "FROM invites ORDER BY id DESC")]
+            "SELECT id, label, created_at, expires_at, used_at, revoked, device_id, "
+            "code_plain FROM invites ORDER BY id DESC")]
 
 
 def revoke_invite(invite_id: int) -> bool:
     with _connect() as con:
-        cur = con.execute("DELETE FROM invites WHERE id = ? AND used_at IS NULL",
-                          (invite_id,))
+        # Flagged, not deleted: a cancelled invite that vanishes leaves no
+        # answer to "did I cancel that, or never send it?"
+        cur = con.execute(
+            "UPDATE invites SET revoked = 1 "
+            "WHERE id = ? AND used_at IS NULL AND revoked = 0",
+            (invite_id,))
         con.commit()
         return cur.rowcount > 0
 
@@ -266,6 +283,8 @@ def redeem(code: str) -> tuple[int, str]:
                           (_hash(code),)).fetchone()
         if not row:
             raise InviteError("Codul de invitație nu este valid.")
+        if row["revoked"]:
+            raise InviteError("Invitația a fost anulată. Cere una nouă.")
         now = datetime.now(timezone.utc)
         if datetime.fromisoformat(row["expires_at"]) < now:
             raise InviteError("Invitația a expirat. Cere una nouă.")

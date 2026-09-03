@@ -3038,8 +3038,21 @@ class Handler(BaseHTTPRequestHandler):
     push: "Push" = None
 
     def _check_admin(self) -> bool:
-        """Admin routes live on the tailnet listener, which injects X-Admin: 1."""
-        return self.headers.get("X-Admin") == "1"
+        """Admin access, proved by a shared secret rather than asserted by a header.
+
+        This was ``X-Admin: 1`` -- a constant any caller could set. The public
+        listener strips it and the listener that injects it is tailnet-bound,
+        so it was not reachable from outside, but it left the admin surface
+        resting entirely on proxy configuration: anything reaching the port
+        directly was admin.
+
+        Fails closed when ADMIN_TOKEN is unset, and compares with
+        compare_digest so a wrong guess takes the same time as a right one.
+        """
+        expected = (os.environ.get("ADMIN_TOKEN") or "").strip()
+        if not expected:
+            return False
+        return secrets.compare_digest(self.headers.get("X-Admin-Token") or "", expected)
 
     def _get_client_ip(self) -> str:
         xff = self.headers.get("X-Forwarded-For")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Literal
 
 from curl_cffi import requests  # browser-TLS client (OLX blocks plain requests)
@@ -176,17 +177,25 @@ def analyze(store, listing: dict[str, Any],
     market = _market_context(store, listing)
     seller = _seller_context(listing.get("seller_id"), listing["id"])
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=_build_content(listing, market, seller),
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            response_mime_type="application/json",
-            response_schema=Verdict,
-            max_output_tokens=16000,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
-    )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=_build_content(listing, market, seller),
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM,
+                    response_mime_type="application/json",
+                    response_schema=Verdict,
+                    max_output_tokens=16000,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            break
+        except Exception as exc:
+            if attempt < 2 and any(k in str(exc) for k in ("503", "429", "UNAVAILABLE")):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
     if response.parsed is not None:
         verdict = response.parsed.model_dump()
     else:

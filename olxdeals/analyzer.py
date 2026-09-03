@@ -1,34 +1,35 @@
-"""LLM analysis of OLX listings with Claude.
+"""LLM analysis of OLX listings with Gemini Flash 3.8.
 
-For a listing we send Claude the title + full description (Romanian), up to
-four photos (as URLs), the seller's profile and other active listings, and the
-statistical market context our scorer already computes. Claude returns a
+For a listing we send Gemini the title + full description (Romanian), up to
+four photos, the seller's profile and other active listings, and the
+statistical market context our scorer already computes. Gemini returns a
 structured verdict (scam risk, condition, consistency, score, negotiation tip)
 enforced by a Pydantic schema. Verdicts are cached in the ``llm_analysis``
 table — each listing is analyzed once unless explicitly re-run.
 
-Requires ``ANTHROPIC_API_KEY`` in the environment (systemd: EnvironmentFile).
+Requires ``GEMINI_API_KEY`` in the environment (systemd: EnvironmentFile).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Literal
 
-import anthropic
 from curl_cffi import requests  # browser-TLS client (OLX blocks plain requests)
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 from .fetcher import API_URL, IMPERSONATE, _HEADERS
 from .scorer import price_distribution, to_ron
 
-MODEL = "claude-opus-4-8"
+MODEL = "gemini-3.8-flash"
 MAX_IMAGES = 4
 
-# Claude Opus 4.8 pricing (USD per token). Adaptive-thinking tokens are billed
-# as output. Update if pricing changes.
-PRICE_IN = 5.0 / 1_000_000
-PRICE_OUT = 25.0 / 1_000_000
+# Gemini 3.8 Flash pricing (USD per token). Thinking tokens are billed as output.
+PRICE_IN = 0.75 / 1_000_000
+PRICE_OUT = 3.75 / 1_000_000
 
 
 def cost_usd(input_tokens: int | None, output_tokens: int | None) -> float:
@@ -89,7 +90,8 @@ def _seller_context(seller_id: int | None, exclude_id: int) -> dict[str, Any]:
                 continue
             pr = {p["key"]: p.get("value") for p in o.get("params", [])}
             price = (pr.get("price") or {}).get("label", "?")
-            items.append(f"{price} — {o.get('title', '')[:60]}")
+            title = o.get("title", "")[:60]
+            items.append(f"{price} — {title}")
         return {
             "other_listings_count": data.get("metadata", {}).get("total_elements"),
             "other_listings_sample": items[:6],
@@ -116,15 +118,30 @@ def _market_context(store, listing: dict[str, Any]) -> dict[str, Any]:
     return ctx
 
 
+def _fetch_image_part(url: str) -> types.Part | None:
+    """Download an image via curl_cffi and wrap it in a Gemini Part."""
+    try:
+        resp = requests.get(url, headers=_HEADERS, impersonate=IMPERSONATE, timeout=10)
+        if resp.status_code == 200 and resp.content:
+            mime = resp.headers.get("content-type") or "image/jpeg"
+            mime = mime.split(";")[0].strip() or "image/jpeg"
+            return types.Part.from_bytes(data=resp.content, mime_type=mime)
+    except Exception:
+        pass
+    return None
+
+
 def _build_content(listing: dict[str, Any], market: dict[str, Any],
-                   seller: dict[str, Any]) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = []
+                   seller: dict[str, Any]) -> list[Any]:
+    parts: list[Any] = []
     try:
         photos = json.loads(listing.get("photos") or "[]")
     except ValueError:
         photos = []
     for url in photos[:MAX_IMAGES]:
-        content.append({"type": "image", "source": {"type": "url", "url": url}})
+        part = _fetch_image_part(url)
+        if part is not None:
+            parts.append(part)
 
     info = {
         "title": listing.get("title"),
@@ -142,31 +159,43 @@ def _build_content(listing: dict[str, Any], market: dict[str, Any],
         "market_context": market,
         "photo_count_total": len(photos),
     }
-    content.append({"type": "text", "text":
-                    "Analyze this OLX.ro listing:\n\n"
-                    + json.dumps(info, ensure_ascii=False, indent=1)})
-    return content
+    prompt_text = (
+        "Analyze this OLX.ro listing:\n\n"
+        + json.dumps(info, ensure_ascii=False, indent=1)
+    )
+    parts.append(types.Part.from_text(text=prompt_text))
+    return parts
 
 
 def analyze(store, listing: dict[str, Any],
-            client: anthropic.Anthropic | None = None) -> dict[str, Any]:
+            client: genai.Client | None = None) -> dict[str, Any]:
     """Analyze one listing row end-to-end; save and return the verdict dict."""
-    client = client or anthropic.Anthropic()
+    if client is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        client = genai.Client(api_key=api_key) if api_key else genai.Client()
     market = _market_context(store, listing)
     seller = _seller_context(listing.get("seller_id"), listing["id"])
 
-    response = client.messages.parse(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=16000,
-        thinking={"type": "adaptive"},
-        system=_SYSTEM,
-        messages=[{"role": "user",
-                   "content": _build_content(listing, market, seller)}],
-        output_format=Verdict,
+        contents=_build_content(listing, market, seller),
+        config=types.GenerateContentConfig(
+            system_instruction=_SYSTEM,
+            response_mime_type="application/json",
+            response_schema=Verdict,
+            max_output_tokens=16000,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
     )
-    verdict = response.parsed_output.model_dump()
-    u = response.usage
-    usage = {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens}
+    if response.parsed is not None:
+        verdict = response.parsed.model_dump()
+    else:
+        verdict = Verdict.model_validate_json(response.text).model_dump()
+
+    u = response.usage_metadata
+    in_tokens = u.prompt_token_count if u else 0
+    out_tokens = ((u.candidates_token_count or 0) + (u.thoughts_token_count or 0)) if u else 0
+    usage = {"input_tokens": in_tokens, "output_tokens": out_tokens}
     store.save_analysis(listing["id"], MODEL, verdict, usage,
-                        cost_usd(u.input_tokens, u.output_tokens))
+                        cost_usd(in_tokens, out_tokens))
     return verdict

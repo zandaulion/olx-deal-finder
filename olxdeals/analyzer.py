@@ -49,6 +49,14 @@ requests to move off-platform. A very low price with a plausible explanation \
 (damage, missing accessories, urgent relocation sale) is NOT automatically a \
 scam — judge the whole picture.
 
+Your own knowledge of product line-ups has a training cutoff and is very \
+likely behind the market. A phone, console or car released after it will look \
+unfamiliar to you, and an unfamiliar model name is not evidence of a fake. \
+Never state that a product does not exist, is not an official release, or is \
+not in a manufacturer's line-up: use the search tool to check first, and if \
+you still cannot confirm it, say the name is unverified and judge the listing \
+on what the photos and text actually show.
+
 Scoring rubric for verdict_score (0-100, buyer's perspective):
 80-100 excellent deal, low risk, act fast; 60-79 good deal, minor caveats; \
 40-59 fair, nothing special or notable uncertainty; 20-39 poor value or \
@@ -187,6 +195,14 @@ def analyze(store, listing: dict[str, Any],
                     response_mime_type="application/json",
                     response_schema=Verdict,
                     max_output_tokens=16000,
+                    # Grounding, because the model's product knowledge is older
+                    # than the market it is judging. Without it a genuine phone
+                    # released after the cutoff reads as a counterfeit: the
+                    # Galaxy S25 Edge was written off as "does not exist in
+                    # Samsung's lineup" and its real dual-camera bump cited as
+                    # proof of a clone. Search fixes the facts; the paragraph
+                    # in _SYSTEM covers what search cannot settle.
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )

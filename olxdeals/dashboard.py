@@ -1689,9 +1689,19 @@ function toggleSeen(e, btn) {{
 
 // Fast client-side quick filter
 function filterCards(q) {{
-  var term = (q || '').toLowerCase().trim();
+  var raw = (q || '').trim();
+  var wantAi = false;
+  var term = raw.toLowerCase();
+  if (term.includes('has:ai') || term.includes('is:ai') || term === '#ai' || term === ':ai') {{
+    wantAi = true;
+    term = term.replace('has:ai', '').replace('is:ai', '').replace('#ai', '').replace(':ai', '').trim();
+  }}
   var count = 0;
   document.querySelectorAll('.card[data-id]').forEach(function(c) {{
+    if (wantAi && !c.classList.contains('has-ai')) {{
+      c.style.display = 'none';
+      return;
+    }}
     var text = (c.innerText || '').toLowerCase();
     var match = !term || text.indexOf(term) !== -1;
     c.style.display = match ? '' : 'none';
@@ -1891,7 +1901,7 @@ function toggleTheme() {{
 # tabs restore where you left off. Single-user local app -> a module dict is fine.
 _LAST_QUERY: dict[str, str] = {}
 _REMEMBER_KEYS = {
-    "/": ["search", "group", "sort", "seller", "pmin", "pmax", "hide_seen"],
+    "/": ["search", "group", "sort", "seller", "ai", "pmin", "pmax", "hide_seen"],
     "/drops": ["search", "group"],
     "/history": ["search", "group"],
 }
@@ -2278,7 +2288,18 @@ def _grouped_menu(groups: dict, base: str, sel_search: str | None,
 def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
     """Instant quick search + filter drawer."""
     def opt(name, value, label):
-        sel = "selected" if f.get(name) == value else ""
+        val = f.get(name)
+        if name == "ai":
+            if value == "analyzed" and val in ("analyzed", "yes", "1", "true", "with_ai"):
+                sel = "selected"
+            elif value == "not_analyzed" and val in ("not_analyzed", "no", "0", "false", "without_ai"):
+                sel = "selected"
+            elif value == (val or "all"):
+                sel = "selected"
+            else:
+                sel = ""
+        else:
+            sel = "selected" if val == value else ""
         return f'<option value="{value}" {sel}>{label}</option>'
     hidden = ""
     if selected:
@@ -2287,13 +2308,21 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
         hidden = f'<input type="hidden" name="group" value="{html.escape(group)}">'
     checked = "checked" if f.get("hide_seen") else ""
     active = (f.get("sort", "deal") != "deal" or f.get("seller", "all") != "all"
+              or f.get("ai", "all") not in ("all", "", None)
               or f.get("pmin") or f.get("pmax") or f.get("hide_seen"))
     badge_html = '<span class="badge-filter">active</span>' if active else ""
+
+    clear_params = []
+    if selected:
+        clear_params.append(f"search={urllib.parse.quote(selected)}")
+    elif group:
+        clear_params.append(f"group={urllib.parse.quote(group)}")
+    clear_href = "/?" + "&".join(clear_params) if clear_params else "/"
 
     return f"""<div class="toolbar">
   <div class="quick-search-box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-    <input class="quick-search-input" id="client-search-input" placeholder="Type to filter listings on screen in real time..." oninput="filterCards(this.value)">
+    <input class="quick-search-input" id="client-search-input" placeholder="Type to filter listings on screen in real time... (e.g. text or has:ai)" oninput="filterCards(this.value)">
   </div>
   <details class="filter-panel" {"open" if active else ""}>
     <summary>
@@ -2305,6 +2334,7 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
         <span>Sort</span>
         <select name="sort">
           {opt('sort','deal','⚡ Deal score')}
+          {opt('sort','ai_score','✦ AI score')}
           {opt('sort','price_asc','Price: Low to High')}
           {opt('sort','price_desc','Price: High to Low')}
           {opt('sort','newest','Newest listed')}
@@ -2319,6 +2349,16 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
         </select>
       </div>
       <div class="filter-group">
+        <span>AI Analysis</span>
+        <select name="ai">
+          {opt('ai','all','All')}
+          {opt('ai','analyzed','✦ With AI analysis')}
+          {opt('ai','not_analyzed','Without AI analysis')}
+          {opt('ai','good','✦ Score ≥ 70')}
+          {opt('ai','low_risk','✦ Low scam risk')}
+        </select>
+      </div>
+      <div class="filter-group">
         <span>Price (RON)</span>
         <input class="px" name="pmin" inputmode="numeric" placeholder="Min" value="{f.get('pmin') or ''}">
         <span>–</span>
@@ -2328,7 +2368,7 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
         <input type="checkbox" name="hide_seen" value="1" {checked}> Hide seen
       </label>
       <button class="btn btn-primary" type="submit" style="padding:5px 12px;font-size:12px">Apply</button>
-      <a class="btn" href="/" style="padding:5px 10px;font-size:12px;color:var(--text-tertiary)">Clear</a>
+      <a class="btn" href="{clear_href}" style="padding:5px 10px;font-size:12px;color:var(--text-tertiary)">Clear</a>
     </form>
   </details>
 </div>"""
@@ -2336,7 +2376,7 @@ def _controls_bar(selected: str | None, group: str | None, f: dict) -> str:
 
 def _matching_active_ids(db_path: str, config_path: str, selected: str | None,
                          group: str | None, seller: str, pmin: int | None,
-                         pmax: int | None) -> list[int]:
+                         pmax: int | None, ai: str = "all") -> list[int]:
     all_keys = _search_keys(config_path, db_path)
     groups, _kg = _search_groups(config_path, db_path)
     if selected in all_keys:
@@ -2347,6 +2387,7 @@ def _matching_active_ids(db_path: str, config_path: str, selected: str | None,
         show = all_keys
     store = Store(db_path)
     try:
+        analyses = store.get_analyses_summary() if ai not in ("all", "", None) else {}
         ids = []
         for key in show:
             for r in store.active_for_search(key):
@@ -2363,7 +2404,17 @@ def _matching_active_ids(db_path: str, config_path: str, selected: str | None,
                     continue
                 if pmax is not None and p > pmax:
                     continue
-                ids.append(r["id"])
+                lid = r["id"]
+                has_analysis = lid in analyses
+                if ai in ("analyzed", "yes", "1", "true", "with_ai") and not has_analysis:
+                    continue
+                if ai in ("not_analyzed", "no", "0", "false", "without_ai") and has_analysis:
+                    continue
+                if ai == "good" and (not has_analysis or (analyses[lid].get("score") or 0) < 70):
+                    continue
+                if ai == "low_risk" and (not has_analysis or analyses[lid].get("scam_risk") != "low"):
+                    continue
+                ids.append(lid)
         return ids
     finally:
         store.close()
@@ -2374,6 +2425,7 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                  filters: dict | None = None) -> str:
     f = filters or {}
     seller = f.get("seller", "all")
+    ai = f.get("ai", "all")
     pmin, pmax = f.get("pmin"), f.get("pmax")
     hide_seen = bool(f.get("hide_seen"))
     sort = f.get("sort", "deal")
@@ -2419,6 +2471,8 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                 else:
                     sel_header = ('<div class="empty">No active listings yet — try Sync now.</div>')
 
+        analyses_summary = store.get_analyses_summary()
+
         def keep(sl) -> bool:
             r = sl.raw
             if sl.price_ron is None or sl.price_ron <= 0:
@@ -2434,6 +2488,16 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
                 return False
             if hide_seen and r.get("seen"):
                 return False
+            lid = r.get("id")
+            has_analysis = lid in analyses_summary
+            if ai in ("analyzed", "yes", "1", "true", "with_ai") and not has_analysis:
+                return False
+            if ai in ("not_analyzed", "no", "0", "false", "without_ai") and has_analysis:
+                return False
+            if ai == "good" and (not has_analysis or (analyses_summary[lid].get("score") or 0) < 70):
+                return False
+            if ai == "low_risk" and (not has_analysis or analyses_summary[lid].get("scam_risk") != "low"):
+                return False
             return True
         pool = [t for t in pool if keep(t[1])]
 
@@ -2443,6 +2507,15 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
             pool.sort(key=lambda t: t[1].price_ron or 0, reverse=True)
         elif sort == "newest":
             pool.sort(key=lambda t: t[1].raw.get("created_time") or "", reverse=True)
+        elif sort == "ai_score":
+            pool.sort(
+                key=lambda t: (
+                    t[1].raw.get("id") in analyses_summary,
+                    (analyses_summary.get(t[1].raw.get("id")) or {}).get("score") or 0,
+                    t[1].deal_score
+                ),
+                reverse=True
+            )
         else:
             pool.sort(key=lambda t: (t[1].is_deal, t[1].deal_score), reverse=True)
         pool.sort(key=lambda t: bool(t[1].raw.get("seen")))
@@ -2466,6 +2539,7 @@ def render_deals(db_path: str, config_path: str, selected: str | None = None,
   <input type="hidden" name="search" value="{html.escape(selected or '')}">
   <input type="hidden" name="group" value="{html.escape(group or '')}">
   <input type="hidden" name="seller" value="{html.escape(seller)}">
+  <input type="hidden" name="ai" value="{html.escape(ai)}">
   <input type="hidden" name="pmin" value="{pmin if pmin is not None else ''}">
   <input type="hidden" name="pmax" value="{pmax if pmax is not None else ''}">
   <input type="hidden" name="next" value="{html.escape(_tab_href('/'))}">
@@ -3226,6 +3300,7 @@ class Handler(BaseHTTPRequestHandler):
             filters = {
                 "sort": qs.get("sort", ["deal"])[0],
                 "seller": qs.get("seller", ["all"])[0],
+                "ai": qs.get("ai", ["all"])[0],
                 "pmin": _int_or_none(qs.get("pmin", [None])[0]),
                 "pmax": _int_or_none(qs.get("pmax", [None])[0]),
                 "hide_seen": qs.get("hide_seen", [None])[0] == "1",
@@ -3433,7 +3508,8 @@ class Handler(BaseHTTPRequestHandler):
                 ids = _matching_active_ids(
                     self.db_path, self.config_path,
                     form.get("search") or None, form.get("group") or None,
-                    form.get("seller", "all"), pmin, pmax)
+                    form.get("seller", "all"), pmin, pmax,
+                    form.get("ai", "all"))
                 store = Store(self.db_path)
                 try:
                     store.mark_seen_bulk(ids)

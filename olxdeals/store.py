@@ -375,6 +375,23 @@ class Store:
         ).fetchall()
         return {r["listing_id"]: dict(r) for r in rows}
 
+    def get_analyses_summary(self, ids: list[int] | None = None) -> dict[int, dict[str, Any]]:
+        """Batch-fetch lightweight analysis records: {listing_id: dict(row)}.
+        If ids is None, returns all analyses."""
+        if ids is not None:
+            if not ids:
+                return {}
+            marks = ",".join("?" * len(ids))
+            rows = self.conn.execute(
+                f"SELECT listing_id, score, scam_risk, ts, model FROM llm_analysis WHERE listing_id IN ({marks})",
+                tuple(ids),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT listing_id, score, scam_risk, ts, model FROM llm_analysis"
+            ).fetchall()
+        return {r["listing_id"]: dict(r) for r in rows}
+
     def add_subscription(self, sub: dict[str, Any], device_id: int | None = None) -> None:
         keys = sub.get("keys") or {}
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(push_subscriptions)")}

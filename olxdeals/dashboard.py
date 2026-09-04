@@ -955,6 +955,17 @@ _CSS = """
     transition: all 0.15s ease;
   }
   .ai-action-btn:hover { background: rgba(192, 132, 252, 0.22); }
+  .ai-reanalyze-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: #c084fc;
+    background: rgba(192, 132, 252, 0.08);
+    border: 1px solid rgba(192, 132, 252, 0.25);
+  }
+  .ai-reanalyze-btn:hover {
+    background: rgba(192, 132, 252, 0.18);
+    border-color: rgba(192, 132, 252, 0.4);
+  }
 
   /* AI Panel */
   .ai-panel {
@@ -1720,25 +1731,35 @@ function toggleAi(e, el) {{
 function runAnalyze(e, btn) {{
   e.preventDefault(); e.stopPropagation();
   if (btn.dataset.busy) return;
-  btn.dataset.busy = '1';
-  btn.textContent = 'analyzing…';
   var card = btn.closest('.card');
+  var btns = card ? card.querySelectorAll('.ai-action-btn') : [btn];
+  btns.forEach(function(b) {{
+    b.dataset.busy = '1';
+    b.dataset.origText = b.textContent;
+    b.textContent = 'analyzing…';
+  }});
   showToast('Running AI inspection...', 'info');
   fetch('/analyze', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-    body: 'id=' + encodeURIComponent(card.dataset.id)
+    body: 'id=' + encodeURIComponent(card ? card.dataset.id : btn.dataset.id)
   }}).then(function(r) {{
     if (r.ok) {{ location.reload(); }}
     else {{
       r.text().then(function(t) {{
         showToast('Analysis failed: ' + (t || r.status), 'warn');
-        delete btn.dataset.busy; btn.textContent = '✦ analyze';
+        btns.forEach(function(b) {{
+          delete b.dataset.busy;
+          b.textContent = b.dataset.origText || '✦ analyze';
+        }});
       }});
     }}
   }}).catch(function(err) {{
     showToast('Analysis failed: ' + err, 'warn');
-    delete btn.dataset.busy; btn.textContent = '✦ analyze';
+    btns.forEach(function(b) {{
+      delete b.dataset.busy;
+      b.textContent = b.dataset.origText || '✦ analyze';
+    }});
   }});
 }}
 
@@ -2067,12 +2088,17 @@ def _ai_bits(analysis: dict | None) -> tuple[str, str, str]:
   <div>Condition: {html.escape(v.get('condition_summary', ''))}</div>
   {'<ul>' + flags + '</ul>' if flags else ''}
   <div style="margin-top:4px">💡 {html.escape(v.get('negotiation_tip', ''))}</div>
-  <div class="ai-meta">Scam risk: <b>{html.escape(str(risk).upper())}</b> · Photos match:
-    {'✓ yes' if v.get('photos_match_description') else '<b style="color:#f43f5e">NO</b>'}</div>
+  <div class="ai-meta" style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+    <span>Scam risk: <b>{html.escape(str(risk).upper())}</b> · Photos match:
+      {'✓ yes' if v.get('photos_match_description') else '<b style="color:#f43f5e">NO</b>'}</span>
+    <span class="ai-action-btn ai-reanalyze-btn" onclick="runAnalyze(event,this)" title="Re-run AI analysis">↻ re-analyze</span>
+  </div>
 </div>"""
     badge = (f'<span class="badge ai-badge {cls}" '
              f'onclick="toggleAi(event,this)">✦ AI {score}</span>')
-    return badge, panel, ""
+    reanalyze_btn = ('<span class="ai-action-btn ai-reanalyze-btn" '
+                     'onclick="runAnalyze(event,this)" title="Re-run AI analysis">↻ re-analyze</span>')
+    return badge, panel, reanalyze_btn
 
 
 def _card(sl, history: list | None = None, search_label: str | None = None,

@@ -21,3 +21,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Private local trial configuration
+.env

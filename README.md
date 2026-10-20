@@ -40,7 +40,15 @@ price-drop history and per-listing exclusions.
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+umask 077
+printf 'ADMIN_TOKEN=%s\nPUBLIC_BASE_URL=http://127.0.0.1:8000\n' \
+  "$(openssl rand -hex 32)" > .env
+set -a
+. ./.env
+set +a
 
 # 1) define what to track (or use the dashboard's Manage tab)
 #    see searches.yaml for the format
@@ -49,13 +57,29 @@ pip install -r requirements.txt
 python run.py
 
 # 3) launch the dashboard
-python -m olxdeals.dashboard --host 0.0.0.0 --port 8000
-# open http://<this-machine>:8000/
+python -m olxdeals.dashboard --host 127.0.0.1 --port 8000
+# open http://127.0.0.1:8000/
 ```
 
-Binding to `0.0.0.0` makes it reachable over a LAN or [Tailscale](https://tailscale.com)
-from your phone. Anyone who can reach the port can edit searches and trigger syncs — keep
-it on a trusted network.
+Use Python 3.12 or newer, `openssl`, and an Internet connection for listing sync.
+The example binds only to loopback. New browsers need a device invitation.
+The commands create a new ignored `.env`; do not overwrite existing private
+configuration. In another terminal in the same checkout, load that file:
+
+```bash
+set -a
+. ./.env
+set +a
+curl --fail http://127.0.0.1:8000/api/admin/invites \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"label":"Demo device"}'
+```
+
+Open the returned invitation URL. For access from your phone, configure HTTPS and
+a private/protected listener; do not expose an unconfigured development port.
+The current backend expects the secret in `X-Admin-Token`, not a legacy `X-Admin`
+marker. Set `ADMIN_TOKEN` in the private container environment too: missing means
+admin access is denied. [Project overview](https://zandaulion.com/olxdeals.html).
 
 ## Finding a model key / category id
 
@@ -174,3 +198,12 @@ deploy/          Containerfile, quadlet units, data import
 ## Licence
 
 [GNU GPL v3](LICENSE).
+
+
+## Support and contributions
+
+Use this repository’s Issues for reproducible bugs and focused feature requests. Include the version, relevant runtime/browser, expected behavior and a minimal synthetic example. Remove credentials, personal records, device identifiers and deployment-specific values before sharing logs or screenshots.
+
+Include a synthetic listing and expected score for scoring changes. Do not run automated tests that contact OLX or paid model endpoints.
+
+Keep changes focused and update the affected documentation. Security-sensitive reports should follow [SECURITY.md](SECURITY.md).

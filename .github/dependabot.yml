@@ -3,6 +3,7 @@
 version: 2
 updates:
 - package-ecosystem: pip
+  assignees: ["zandaulion"]
   directory: /
   schedule:
     interval: weekly

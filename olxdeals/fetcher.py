@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -59,6 +60,28 @@ class SearchSpec:
     price_to: int | None = None
     region_id: int | None = None
     paused: bool = False  # when true, the sync skips this search (data frozen)
+    # Text filters for what OLX's own filters can't express (e.g. a RAM size
+    # inside a coarse "> 16 GB" bucket). Case-insensitive regexes, applied to
+    # each listing after fetching; a rejected listing is never stored.
+    title_match: str | None = None   # must match the title
+    require: list[str] = field(default_factory=list)  # each must match title+description
+    exclude: str | None = None       # must NOT match title+description
+    # "deals" pushes only scored deals; "new" pushes every new listing, for
+    # searches too thin to score (deal scoring needs MIN_SAMPLE prices).
+    notify: str = "deals"
+
+    def accepts(self, listing: dict[str, Any]) -> bool:
+        """True when a normalised listing passes the text filters."""
+        title = listing.get("title") or ""
+        if self.title_match and not re.search(self.title_match, title, re.I):
+            return False
+        if not (self.require or self.exclude):
+            return True
+        desc = re.sub(r"<[^>]+>", " ", listing.get("description") or "")
+        text = f"{title}\n{desc}"
+        if self.exclude and re.search(self.exclude, text, re.I):
+            return False
+        return all(re.search(r, text, re.I) for r in self.require)
 
     def build_params(self, offset: int, limit: int) -> list[tuple[str, str]]:
         """Build the flat query params OLX expects (order-insensitive)."""
@@ -197,7 +220,9 @@ class OlxFetcher:
             if not batch:
                 break
             for offer in batch:
-                yield normalise(offer, spec.key)
+                listing = normalise(offer, spec.key)
+                if spec.accepts(listing):
+                    yield listing
             # Stop when the API says there's no next page.
             if not (payload.get("links") or {}).get("next"):
                 break

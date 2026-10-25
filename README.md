@@ -90,6 +90,28 @@ python -m olxdeals.discover "iphone 15 pro"
 Prints the category ids and model keys that actually appear in real listings, with counts.
 The dashboard's Manage tab has the same finder as tappable chips.
 
+## Text filters (YAML only)
+
+When OLX's own filters are too coarse, e.g. RAM only goes up to a "> 16 GB" bucket,
+a search can filter on the listing text after fetching. All patterns are
+case-insensitive regexes:
+
+```yaml
+- key: mac_mini_24gb
+  category_id: 2419
+  query: mac mini
+  title_match: 'mac\s*-?\s*mini'       # must match the title
+  require:                             # each must match title + description
+  - '\bm[1-9](?!\d)'
+  - '(?<![\d.])(24|32|48|64)\s*gb(?!\s*ssd)'
+  exclude: 'intel'                     # must not match title + description
+  notify: new                          # push every new listing, not only deals
+```
+
+`notify: new` is for thin searches: deal scoring needs at least five prices to
+judge, so a search with a handful of listings would otherwise never push. The
+Manage tab doesn't show these fields, but saving a search there keeps them.
+
 ## Always-on (rootless podman)
 
 [`deploy/`](deploy) runs the dashboard as a rootless container with an hourly

@@ -9,6 +9,9 @@ import yaml
 from .fetcher import SearchSpec
 
 
+YAML_ONLY_KEYS = ("title_match", "require", "exclude", "notify")
+
+
 def load_raw(path: str | Path) -> dict:
     """Return the parsed YAML as a plain dict (for editing/round-tripping)."""
     p = Path(path)
@@ -32,6 +35,11 @@ def upsert_search(path: str | Path, search: dict) -> None:
                 if s.get("key") == search["key"]), None)
     if old and old.get("paused"):  # editing shouldn't silently un-pause
         search["paused"] = True
+    # Text filters and notify mode are YAML-only; the Manage form doesn't
+    # know them, so carry them over rather than dropping them on save.
+    for k in YAML_ONLY_KEYS:
+        if old and k in old and k not in search:
+            search[k] = old[k]
     searches = [s for s in data["searches"] if s.get("key") != search["key"]]
     searches.append(search)
     data["searches"] = searches
@@ -74,6 +82,10 @@ def load_searches(path: str | Path) -> list[SearchSpec]:
                 price_to=raw.get("price_to"),
                 region_id=raw.get("region_id"),
                 paused=bool(raw.get("paused")),
+                title_match=raw.get("title_match"),
+                require=list(raw.get("require") or []),
+                exclude=raw.get("exclude"),
+                notify=raw.get("notify", "deals"),
             )
         )
     if not specs:

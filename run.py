@@ -140,15 +140,20 @@ def notify_ntfy(summary: list[dict], db_path: str | None = None) -> None:
             store.set_meta("ntfy_last_beat", now)
 
 
-def notify_new_deals(store, push, search_key, active, result) -> None:
-    """Push a batched notification when newly-appeared listings are deals."""
+def notify_new_deals(store, push, search_key, active, result,
+                     notify: str = "deals") -> None:
+    """Push a batched notification when newly-appeared listings are deals.
+
+    With ``notify="new"`` every new listing counts, not only scored deals.
+    """
     subs = store.all_subscriptions()
     if not subs or not result.new:
         return
     new_ids = {l["id"] for l in result.new}
     sd = score_search(search_key, active)
     new_deals = [sl for sl in sd.listings
-                 if sl.raw["id"] in new_ids and sl.is_deal]
+                 if sl.raw["id"] in new_ids
+                 and (sl.is_deal or (notify == "new" and not sl.junk))]
     if not new_deals:
         return
     cheapest = min(new_deals, key=lambda s: s.price_ron or float("inf"))
@@ -159,8 +164,9 @@ def notify_new_deals(store, push, search_key, active, result) -> None:
         body += (f"\nAI: {analysis['score']}/100 · "
                  f"{(analysis.get('summary') or '')[:90]}")
     n = len(new_deals)
+    noun = "listing" if notify == "new" else "deal"
     payload = {
-        "title": f"{n} new deal{'s' if n > 1 else ''} · {search_key}",
+        "title": f"{n} new {noun}{'s' if n > 1 else ''} · {search_key}",
         "body": body,
         "url": f"/?search={search_key}",
         "tag": f"deal-{search_key}",
@@ -249,7 +255,7 @@ def _run_all(args, fetcher, push, summary: list[dict],
             dist = price_distribution(active)
             if dist:
                 store.record_stats(spec.key, dist)
-            notify_new_deals(store, push, spec.key, active, result)
+            notify_new_deals(store, push, spec.key, active, result, spec.notify)
             dur = int((time.monotonic() - started) * 1000)
             store.record_run(spec.key, ok=True, duration_ms=dur, result=result)
             summary.append({"key": spec.key, "ok": True,

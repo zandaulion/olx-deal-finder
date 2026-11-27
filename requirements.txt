@@ -1,6 +1,6 @@
 requests==2.34.2
-PyYAML==6.0.3
+PyYAML==6.0.4
 pywebpush==2.5.0
 cryptography==50.0.2
-google-genai==3.4.0
+google-genai==3.6.1
 curl_cffi==0.17.0
